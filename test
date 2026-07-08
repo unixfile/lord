@@ -1,8 +1,9 @@
 #!/bin/sh
 # exercise the lord state machine end to end
+# shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -u
 
-here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+here=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 T=${1:-${TMPDIR:-/tmp}/lord-test-$$}
 rm -rf "$T"
 mkdir -p "$T/bin"
@@ -17,7 +18,7 @@ pass=0 failn=0
 ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
 bad()  { failn=$((failn+1)); printf 'FAIL %s\n' "$*"; }
 check() { # check <desc> <cmd...>
-    local d=$1; shift
+    local d="$1"; shift
     if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi
 }
 

@@ -18,6 +18,7 @@
 #   XDG_DATA_HOME    default $HOME/.local/share
 #   XDG_CONFIG_HOME  default $HOME/.config
 
+# shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -eu
 
 VERSION='1.0'
@@ -55,13 +56,13 @@ config: $LORD_CONFIG, default $XDG_CONFIG_HOME/lord (~/.config/lord)
 EOF
 }
 
-error() { local code=$1; shift; printf 'E%d: %s\n' "$code" "$*" >&2; exit "$code"; }
-fail()  { local code=$1; shift; printf 'E%d: %s\n' "$code" "$*" >&2; [ "$rc" != 0 ] || rc=$code; }
+error() { local code="$1"; shift; printf 'E%d: %s\n' "$code" "$*" >&2; exit "$code"; }
+fail()  { local code="$1"; shift; printf 'E%d: %s\n' "$code" "$*" >&2; [ "$rc" != 0 ] || rc=$code; }
 warn()  { printf 'warn: %s\n' "$*" >&2; }
 
 # Replace the lord-managed fenced block in $1 with stdin, appending if absent.
 fence() {
-    local dst=$1 tmp
+    local dst="$1" tmp
     tmp=$(mktemp)
     if [ -f "$dst" ]; then
         awk -v m="$MARKER" '
@@ -81,7 +82,7 @@ fence() {
 
 # Remove the lord-managed fenced block from $1.
 defence() {
-    local dst=$1 tmp
+    local dst="$1" tmp
     [ -f "$dst" ] || return 0
     tmp=$(mktemp)
     awk -v m="$MARKER" '
@@ -206,7 +207,7 @@ converge_manifest() {
 }
 
 process_entry() {
-    local entry=$1 w="$proj/$1" s="$store/$1" target
+    local entry="$1" w="$proj/$1" s="$store/$1" target
 
     if tracked "$entry"; then
         fail 1 "tracked in git, refusing to manage: $entry"
@@ -260,7 +261,7 @@ process_entry() {
 # orphan, never restored. Recurses into directories that are ancestors of
 # entries or that mirror a real worktree directory.
 sweep_store() {
-    local dir=$1 path rel entry covered w d
+    local dir="$1" path rel entry covered w d
 
     for path in "$store/$dir".[!.]* "$store/$dir"*; do
         { [ -e "$path" ] || [ -L "$path" ]; } || continue

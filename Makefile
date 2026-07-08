@@ -4,7 +4,8 @@ check:
 	./test
 
 install:
-	install -CD -m 755 lord $(DESTDIR)$(PREFIX)/bin/lord
+	mkdir -p $(DESTDIR)$(PREFIX)/bin
+	install -C -m 755 lord $(DESTDIR)$(PREFIX)/bin/lord
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/lord
