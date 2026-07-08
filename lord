@@ -20,6 +20,7 @@
 
 set -eu
 
+VERSION='1.0'
 LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
 LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
 MARKER='# lord-managed'
@@ -32,7 +33,7 @@ mfile=
 
 usage() {
     cat <<'EOF'
-usage: lord [-n] [-e] [dir]
+usage: lord [-n] [-e] [-V] [dir]
 
 Converge the git repo at dir (default: current directory) to its .lord
 manifest. .lord lists one literal path per line; each listed file lives in
@@ -46,6 +47,7 @@ With nothing to do it prints nothing and exits 0.
   -n  dry run: report what a run would do, change nothing
   -e  eject: move every managed file back into the worktree, remove the
       exclude and hook blocks, and delete the repo's store dir if emptied
+  -V  print version
 
 store:  $LORD_DIR, default $XDG_DATA_HOME/lord (~/.local/share/lord),
         keyed by the origin URL: <host>/<owner>/<repo>
@@ -386,12 +388,16 @@ EOF
 main() {
     local proj gitdir remote key store entries excl entry opt
 
-    case ${1-} in --help) usage; exit 0 ;; esac
-    while getopts :hne opt; do
+    case ${1-} in
+        --help)    usage; exit 0 ;;
+        --version) printf 'lord %s\n' "$VERSION"; exit 0 ;;
+    esac
+    while getopts :hneV opt; do
         case $opt in
             h) usage; exit 0 ;;
             n) dry=1 ;;
             e) eject=1 ;;
+            V) printf 'lord %s\n' "$VERSION"; exit 0 ;;
             ?) error 22 "unknown flag: -$OPTARG" ;;
         esac
     done

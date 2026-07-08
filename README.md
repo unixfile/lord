@@ -41,14 +41,19 @@ one initialized, copied from `$LORD_CONFIG/skel` if that file exists.
 With nothing to do it prints nothing and exits 0. The only destructive
 operation is the adoption rename.
 
+One caveat: a repo that sets `core.hooksPath`, husky for example, never runs
+hooks from `.git/hooks`, so the guards are silent there. Run lord by hand in
+those repos or call it from the custom hooks.
+
 ## Usage
 
 ```
-usage: lord [-n] [-e] [dir]
+usage: lord [-n] [-e] [-V] [dir]
 
   -n  dry run: report what a run would do, change nothing
   -e  eject: move every managed file back into the worktree, remove the
       exclude and hook blocks, and delete the repo's store dir if emptied
+  -V  print version
 ```
 
 dir defaults to the current directory and may be anywhere inside the repo.
@@ -68,6 +73,20 @@ Files live under `$LORD_DIR`, default `~/.local/share/lord`, keyed by the
 origin URL as `<host>/<owner>/<repo>`. Both ssh and https remotes normalize
 to the same key, so reclones and remote rewrites find the same store. A repo
 needs an origin remote; it need not exist on the host yet.
+
+The store is plain files, so syncing it between machines is left to tools
+that already do that well. Put `~/.local/share/lord` in syncthing, a private
+git repo or an rsync job, and every checkout on every machine converges to
+the same private files.
+
+Renaming the origin changes the key, so eject before the rename and
+reconverge after:
+
+```
+$ lord -e
+$ git remote set-url origin git@github.com:acme/app2.git
+$ lord
+```
 
 ## Manifest rules
 
@@ -118,5 +137,9 @@ a single POSIX sh script; it needs git, awk and standard utilities.
 make check
 ```
 
-Runs the end-to-end suite: 118 checks across adoption, fresh clones,
+Runs the end-to-end suite: 121 checks across adoption, fresh clones,
 conflicts, hooks, eject and dry runs.
+
+## License
+
+MIT

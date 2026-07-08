@@ -222,9 +222,13 @@ case $out in *"E1: tracked in git, refusing to manage: creds"*) ok "post-checkou
 # --- usage ---------------------------------------------------------------
 out=$(lord --help); st=$?
 check "--help exits 0" test "$st" = 0
-case $out in "usage: lord [-n] [-e] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
+case $out in "usage: lord [-n] [-e] [-V] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
 out=$(lord -x 2>&1); st=$?
 check "unknown flag exits 22" test "$st" = 22
+out=$(lord -V); st=$?
+check "-V exits 0" test "$st" = 0
+case $out in "lord "[0-9]*) ok "-V prints version";; *) bad "-V output: $out";; esac
+check "--version matches -V" test "$(lord --version)" = "$out"
 
 # --- xdg fallback: LORD_DIR unset -> XDG_DATA_HOME/lord -----------------
 R7="$T/repo7"
