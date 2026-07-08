@@ -1,0 +1,450 @@
+#!/bin/sh
+# lord — converge a git repo to its .lord manifest of private, unversioned files
+#
+# .lord in the repo root lists paths, one literal path per line, that live in
+# the lord store (keyed by the origin URL) and appear in the worktree as
+# symlinks. Running lord with no arguments adopts new listed files into the
+# store, links store entries into fresh clones, moves unlisted-but-still-
+# linked files back into the worktree, regenerates the fenced block in
+# .git/info/exclude, installs hooks, and reports conflicts instead of
+# guessing. A repo with no manifest anywhere gets one initialized in the
+# store and linked, copied from the config skel if that file exists.
+# The only destructive operation is the adoption rename. With nothing to do
+# it prints nothing and exits 0.
+#
+# Environment:
+#   LORD_DIR         store root; default $XDG_DATA_HOME/lord
+#   LORD_CONFIG      config dir holding skel; default $XDG_CONFIG_HOME/lord
+#   XDG_DATA_HOME    default $HOME/.local/share
+#   XDG_CONFIG_HOME  default $HOME/.config
+
+set -eu
+
+LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
+LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
+MARKER='# lord-managed'
+MANIFEST='.lord'
+
+rc=0
+dry=
+eject=
+mfile=
+
+usage() {
+    cat <<'EOF'
+usage: lord [-n] [-e] [dir]
+
+Converge the git repo at dir (default: current directory) to its .lord
+manifest. .lord lists one literal path per line; each listed file lives in
+the lord store and appears in the worktree as a symlink. lord adopts new
+listed files into the store, links store entries into fresh clones, moves
+files back when their line is removed, keeps .git/info/exclude and hooks
+in sync, and refuses on conflicts. A repo without a manifest gets one
+initialized and linked, seeded from $LORD_CONFIG/skel if that file exists.
+With nothing to do it prints nothing and exits 0.
+
+  -n  dry run: report what a run would do, change nothing
+  -e  eject: move every managed file back into the worktree, remove the
+      exclude and hook blocks, and delete the repo's store dir if emptied
+
+store:  $LORD_DIR, default $XDG_DATA_HOME/lord (~/.local/share/lord),
+        keyed by the origin URL: <host>/<owner>/<repo>
+config: $LORD_CONFIG, default $XDG_CONFIG_HOME/lord (~/.config/lord)
+EOF
+}
+
+error() { local code=$1; shift; printf 'E%d: %s\n' "$code" "$*" >&2; exit "$code"; }
+fail()  { local code=$1; shift; printf 'E%d: %s\n' "$code" "$*" >&2; [ "$rc" != 0 ] || rc=$code; }
+warn()  { printf 'warn: %s\n' "$*" >&2; }
+
+# Replace the lord-managed fenced block in $1 with stdin, appending if absent.
+fence() {
+    local dst=$1 tmp
+    tmp=$(mktemp)
+    if [ -f "$dst" ]; then
+        awk -v m="$MARKER" '
+            $0 == m " begin" { skip = 1 }
+            skip { if ($0 == m " end") skip = 0; next }
+            { print }
+        ' "$dst" > "$tmp"
+    fi
+    {
+        printf '%s begin\n' "$MARKER"
+        cat
+        printf '%s end\n' "$MARKER"
+    } >> "$tmp"
+    cat "$tmp" > "$dst"
+    rm -f "$tmp"
+}
+
+# Remove the lord-managed fenced block from $1.
+defence() {
+    local dst=$1 tmp
+    [ -f "$dst" ] || return 0
+    tmp=$(mktemp)
+    awk -v m="$MARKER" '
+        $0 == m " begin" { skip = 1 }
+        skip { if ($0 == m " end") skip = 0; next }
+        { print }
+    ' "$dst" > "$tmp"
+    cat "$tmp" > "$dst"
+    rm -f "$tmp"
+}
+
+install_hook() {
+    local dst="$gitdir/hooks/$1"
+    mkdir -p "$gitdir/hooks"
+    if [ ! -f "$dst" ]; then
+        printf '#!/bin/sh\n' > "$dst"
+        chmod +x "$dst"
+    fi
+    printf 'lord\n' | fence "$dst"
+}
+
+remove_hook() {
+    local dst="$gitdir/hooks/$1"
+    [ -f "$dst" ] || return 0
+    defence "$dst"
+    # drop the file if only our own trampoline stub remains
+    [ "$(cat "$dst")" = '#!/bin/sh' ] && rm "$dst"
+    return 0
+}
+
+tracked() {
+    [ -n "$(git -C "$proj" ls-files --cached -- ":(literal)$1" 2>/dev/null)" ]
+}
+
+# Parse the manifest at $1 into $entries and the exclude block $excl.
+read_entries() {
+    local line
+    entries=
+    excl="/$MANIFEST
+"
+    [ -n "$1" ] || return 0
+    while IFS= read -r line; do
+        case $line in ''|'#'*) continue ;; esac
+        line=${line%/}
+        case $line in "$MANIFEST") continue ;; esac
+        case $line in
+            /*|..|../*|*/..|*/../*)
+                fail 22 "invalid manifest entry: $line"
+                continue ;;
+        esac
+        entries="$entries$line
+"
+        excl="$excl/$line
+"
+    done < "$1"
+}
+
+# Entry zero: converge the manifest itself before reading it. Sets $mfile to
+# a readable copy of the manifest ('' when a bare init leaves nothing to read).
+converge_manifest() {
+    local w="$proj/$MANIFEST" s="$store/$MANIFEST" target
+
+    if [ -L "$w" ]; then
+        target=$(readlink "$w")
+        [ "$target" = "$s" ] \
+            || error 17 "conflict: $MANIFEST is a symlink to $target, expected $s"
+        [ -f "$s" ] || error 2 "manifest missing from store: $s"
+        mfile=$w
+        return 0
+    fi
+    if [ -e "$w" ] && [ ! -f "$w" ]; then
+        error 21 "manifest is not a regular file: $w"
+    fi
+
+    if [ -f "$w" ] && [ -f "$s" ]; then
+        if cmp -s "$w" "$s"; then
+            error 17 "conflict: $MANIFEST in both worktree and store (identical): remove one and rerun"
+        fi
+        error 17 "conflict: $MANIFEST in both worktree and store: resolve manually"
+    fi
+    if [ -f "$w" ]; then
+        tracked "$MANIFEST" && error 1 "tracked in git, refusing to manage: $MANIFEST"
+        printf 'adopt %s\n' "$MANIFEST"
+        mfile=$w
+        if [ -z "$dry" ]; then
+            mkdir -p "$store"
+            mv "$w" "$s"
+            ln -s "$s" "$w"
+        fi
+        return 0
+    fi
+    if [ -f "$s" ]; then
+        printf 'link %s\n' "$MANIFEST"
+        if [ -n "$dry" ]; then
+            mfile=$s
+            return 0
+        fi
+        ln -s "$s" "$w"
+        mfile=$w
+        return 0
+    fi
+
+    # no manifest anywhere: bootstrap one, seeded from the skeleton if present
+    if [ -f "$LORD_CONFIG/skel" ]; then
+        printf 'init %s (from skel)\n' "$MANIFEST"
+        mfile="$LORD_CONFIG/skel"
+    else
+        printf 'init %s\n' "$MANIFEST"
+        mfile=
+    fi
+    if [ -z "$dry" ]; then
+        mkdir -p "$store"
+        if [ -f "$LORD_CONFIG/skel" ]; then
+            cp "$LORD_CONFIG/skel" "$s"
+        else
+            printf '# lord manifest: one literal path per line\n' > "$s"
+        fi
+        ln -s "$s" "$w"
+        mfile=$w
+    fi
+    return 0
+}
+
+process_entry() {
+    local entry=$1 w="$proj/$1" s="$store/$1" target
+
+    if tracked "$entry"; then
+        fail 1 "tracked in git, refusing to manage: $entry"
+        return 0
+    fi
+
+    if [ -L "$w" ]; then
+        target=$(readlink "$w")
+        if [ "$target" = "$s" ]; then
+            [ -e "$s" ] || warn "store entry missing behind link: $entry"
+        else
+            fail 17 "conflict: $entry is a symlink to $target, expected $s"
+        fi
+        return 0
+    fi
+
+    if [ -e "$w" ] && [ -e "$s" ]; then
+        if [ -f "$w" ] && [ -f "$s" ] && cmp -s "$w" "$s"; then
+            fail 17 "conflict: $entry in both worktree and store (identical): remove one and rerun"
+        else
+            fail 17 "conflict: $entry in both worktree and store: resolve manually"
+        fi
+        return 0
+    fi
+
+    if [ -e "$w" ]; then
+        printf 'adopt %s\n' "$entry"
+        if [ -z "$dry" ]; then
+            mkdir -p "${s%/*}"
+            mv "$w" "$s"
+            ln -s "$s" "$w"
+        fi
+        return 0
+    fi
+
+    if [ -e "$s" ]; then
+        printf 'link %s\n' "$entry"
+        if [ -z "$dry" ]; then
+            mkdir -p "${w%/*}"
+            ln -s "$s" "$w"
+        fi
+    fi
+    # listed but exists nowhere: the exclude is already written, so the file
+    # is ignored the moment it appears and the next run adopts it
+    return 0
+}
+
+# Walk store paths not listed in the manifest. An unlisted entry whose
+# worktree symlink still points at it was unlisted on purpose: move it back
+# and drop the link. Anything unlisted without that proof is reported as an
+# orphan, never restored. Recurses into directories that are ancestors of
+# entries or that mirror a real worktree directory.
+sweep_store() {
+    local dir=$1 path rel entry covered w d
+
+    for path in "$store/$dir".[!.]* "$store/$dir"*; do
+        { [ -e "$path" ] || [ -L "$path" ]; } || continue
+        rel=${path#"$store/"}
+        case $rel in "$MANIFEST") continue ;; esac
+        covered=none
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            if [ "$rel" = "$entry" ]; then
+                covered=exact
+                break
+            fi
+            case $entry in "$rel"/*) covered=parent; break ;; esac
+        done <<EOF
+$entries
+EOF
+        case $covered in
+            exact)  continue ;;
+            parent) sweep_store "$rel/"; continue ;;
+        esac
+        w="$proj/$rel"
+        if [ -L "$w" ] && [ "$(readlink "$w")" = "$path" ]; then
+            printf 'restore %s\n' "$rel"
+            if [ -z "$dry" ]; then
+                rm "$w"
+                mv "$path" "$w"
+                # prune store dirs left empty by the restore
+                d=${path%/*}
+                while [ "$d" != "$store" ] && rmdir "$d" 2>/dev/null; do
+                    d=${d%/*}
+                done
+            fi
+        elif [ -d "$w" ] && [ ! -L "$w" ] && [ -d "$path" ]; then
+            sweep_store "$rel/"
+        else
+            warn "orphan in store, not in manifest: $rel"
+        fi
+    done
+}
+
+# Warn about worktree symlinks into the store that the manifest does not
+# account for, e.g. left dangling by a restore in another clone.
+sweep_links() {
+    local link target rel entry listed
+
+    find "$proj" -name .git -prune -o -type l -print | while IFS= read -r link; do
+        target=$(readlink "$link")
+        case $target in "$LORD_DATA"/*) ;; *) continue ;; esac
+        rel=${link#"$proj/"}
+        case $rel in "$MANIFEST") continue ;; esac
+        listed=
+        while IFS= read -r entry; do
+            if [ -n "$entry" ] && [ "$rel" = "$entry" ]; then
+                listed=1
+                break
+            fi
+        done <<EOF
+$entries
+EOF
+        [ -n "$listed" ] || warn "unlisted symlink into lord store: $rel -> $target"
+    done
+}
+
+# Undo lord management: move every managed file back into the worktree,
+# manifest last, then strip the fenced blocks and prune the emptied store.
+eject_repo() {
+    local entry w s
+
+    if [ -L "$proj/$MANIFEST" ]; then
+        [ "$(readlink "$proj/$MANIFEST")" = "$store/$MANIFEST" ] \
+            || error 17 "conflict: $MANIFEST is a symlink to $(readlink "$proj/$MANIFEST"), expected $store/$MANIFEST"
+        [ -f "$store/$MANIFEST" ] || error 2 "manifest missing from store: $store/$MANIFEST"
+
+        read_entries "$proj/$MANIFEST"
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            w="$proj/$entry" s="$store/$entry"
+            if [ -L "$w" ] && [ "$(readlink "$w")" = "$s" ]; then
+                printf 'restore %s\n' "$entry"
+                if [ -z "$dry" ]; then
+                    rm "$w"
+                    mv "$s" "$w"
+                fi
+            elif [ ! -e "$w" ] && [ -e "$s" ]; then
+                printf 'restore %s\n' "$entry"
+                if [ -z "$dry" ]; then
+                    mkdir -p "${w%/*}"
+                    mv "$s" "$w"
+                fi
+            elif [ -e "$w" ] && [ -e "$s" ]; then
+                fail 17 "conflict: $entry in both worktree and store: resolve manually"
+            fi
+        done <<EOF
+$entries
+EOF
+
+        printf 'restore %s\n' "$MANIFEST"
+        if [ -z "$dry" ]; then
+            rm "$proj/$MANIFEST"
+            mv "$store/$MANIFEST" "$proj/$MANIFEST"
+        fi
+    fi
+
+    if [ -z "$dry" ]; then
+        defence "$gitdir/info/exclude"
+        remove_hook pre-commit
+        remove_hook post-checkout
+        remove_hook post-merge
+        if [ -d "$store" ]; then
+            find "$store" -depth -type d -exec rmdir {} + 2>/dev/null || true
+        fi
+        if [ -d "$store" ]; then
+            warn "store not empty, left in place: $store"
+        else
+            # prune empty key dirs (owner, host) up to the store root
+            s=${store%/*}
+            while [ "$s" != "$LORD_DATA" ] && rmdir "$s" 2>/dev/null; do
+                s=${s%/*}
+            done
+        fi
+    fi
+    exit "$rc"
+}
+
+main() {
+    local proj gitdir remote key store entries excl entry opt
+
+    case ${1-} in --help) usage; exit 0 ;; esac
+    while getopts :hne opt; do
+        case $opt in
+            h) usage; exit 0 ;;
+            n) dry=1 ;;
+            e) eject=1 ;;
+            ?) error 22 "unknown flag: -$OPTARG" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    proj="${1:-$PWD}"
+    proj=$(git -C "$proj" rev-parse --show-toplevel 2>/dev/null) \
+        || error 22 "not inside a git work tree: ${1:-$PWD}"
+    gitdir=$(git -C "$proj" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || gitdir=$(git -C "$proj" rev-parse --absolute-git-dir)
+
+    remote=$(git -C "$proj" remote get-url origin 2>/dev/null) \
+        || error 2 "no remote named origin: lord keys its store by the origin URL
+hint: declare one now, it need not exist yet: git remote add origin git@github.com:<owner>/<repo>.git"
+
+    # git@host:owner/repo.git and scheme://user@host/owner/repo.git
+    # both become host/owner/repo
+    key=${remote#*://}
+    key=${key#*@}
+    case $key in *:*) key="${key%%:*}/${key#*:}" ;; esac
+    key=${key%/}
+    key=${key%.git}
+    store="$LORD_DATA/$key"
+
+    [ -n "$eject" ] && eject_repo
+
+    converge_manifest
+    read_entries "$mfile"
+
+    if [ -z "$dry" ]; then
+        mkdir -p "$gitdir/info"
+        printf '%s' "$excl" | fence "$gitdir/info/exclude"
+    fi
+
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        process_entry "$entry"
+    done <<EOF
+$entries
+EOF
+
+    # pre-commit blocks listed paths from being committed; checkout and merge
+    # can materialize a listed file from history, worth surfacing immediately
+    if [ -z "$dry" ]; then
+        install_hook pre-commit
+        install_hook post-checkout
+        install_hook post-merge
+    fi
+
+    sweep_store ''
+    sweep_links
+
+    exit "$rc"
+}
+
+main "$@"

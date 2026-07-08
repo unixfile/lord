@@ -1,0 +1,359 @@
+#!/bin/sh
+# exercise the lord state machine end to end
+set -u
+
+here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+T=${1:-${TMPDIR:-/tmp}/lord-test-$$}
+rm -rf "$T"
+mkdir -p "$T/bin"
+ln -s "$here/lord" "$T/bin/lord"
+export PATH="$T/bin:$PATH"
+export LORD_DIR="$T/store"
+export LORD_CONFIG="$T/config"
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
+
+pass=0 failn=0
+ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
+bad()  { failn=$((failn+1)); printf 'FAIL %s\n' "$*"; }
+check() { # check <desc> <cmd...>
+    local d=$1; shift
+    if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi
+}
+
+STORE="$T/store/github.com/acme/app"
+
+# --- repo1: adoption ---------------------------------------------------
+R1="$T/repo1"
+git init -q -b main "$R1"
+git -C "$R1" remote add origin git@github.com:acme/app.git
+printf 'readme\n' > "$R1/README.md"
+git -C "$R1" add README.md && git -C "$R1" commit -qm init
+
+printf 'SECRET=1\n' > "$R1/.env"
+mkdir -p "$R1/.claude"
+printf '{}\n' > "$R1/.claude/settings.json"
+printf '.env\n.claude/\nghost.txt\n# comment\n\n' > "$R1/.lord"
+
+out=$(cd "$R1" && lord 2>&1); st=$?
+printf -- '--- first run ---\n%s\n' "$out"
+check "first run exits 0" test "$st" = 0
+check ".lord adopted as symlink" test -L "$R1/.lord"
+check ".lord in store" test -f "$STORE/.lord"
+check ".env adopted as symlink" test -L "$R1/.env"
+check ".env content in store" grep -q SECRET=1 "$STORE/.env"
+check ".claude adopted (trailing slash stripped)" test -L "$R1/.claude"
+check ".claude dir in store" test -f "$STORE/.claude/settings.json"
+check "exclude has /.lord" grep -qxF '/.lord' "$R1/.git/info/exclude"
+check "exclude has /.env" grep -qxF '/.env' "$R1/.git/info/exclude"
+check "exclude has /ghost.txt" grep -qxF '/ghost.txt' "$R1/.git/info/exclude"
+check "pre-commit hook installed" grep -qxF 'lord' "$R1/.git/hooks/pre-commit"
+check "post-checkout hook installed" test -x "$R1/.git/hooks/post-checkout"
+check "post-merge hook installed" test -x "$R1/.git/hooks/post-merge"
+check "git status clean" test -z "$(git -C "$R1" status --porcelain)"
+
+out=$(cd "$R1" && lord 2>&1); st=$?
+check "second run silent" test -z "$out"
+check "second run exits 0" test "$st" = 0
+
+# ghost.txt appears later -> already ignored, adopted on next run
+printf 'boo\n' > "$R1/ghost.txt"
+check "ghost.txt ignored before adoption" test -z "$(git -C "$R1" status --porcelain)"
+out=$(cd "$R1" && lord 2>&1)
+check "ghost adopted on appearance" test -L "$R1/ghost.txt"
+check "ghost run printed only adopt line" test "$out" = "adopt ghost.txt"
+
+# edit manifest through the symlink -> lands in store
+printf 'nested/dir/token\n' >> "$R1/.lord"
+check "manifest edit lands in store" grep -q nested/dir/token "$STORE/.lord"
+out=$(cd "$R1" && lord 2>&1)   # refresh exclude so the new entry is ignored
+mkdir -p "$R1/nested/dir" && printf 'tok\n' > "$R1/nested/dir/token"
+out=$(cd "$R1" && lord 2>&1)
+check "nested entry adopted" test -L "$R1/nested/dir/token"
+check "nested entry in store" test -f "$STORE/nested/dir/token"
+
+# run from a subdirectory
+out=$(cd "$R1/nested" && lord 2>&1); st=$?
+check "run from subdir silent+0" test "$st" = 0 -a -z "$out"
+
+# pre-commit guard: force-add a listed file
+git -C "$R1" add -f .env 2>/dev/null
+if git -C "$R1" commit -qm leak 2>"$T/precommit.err"; then
+    bad "pre-commit blocks staged listed path"
+    git -C "$R1" reset -q HEAD~1 2>/dev/null
+else
+    ok "pre-commit blocks staged listed path"
+fi
+check "pre-commit error is E1" grep -q '^E1: tracked in git' "$T/precommit.err"
+git -C "$R1" reset -q -- .env
+
+# pre-commit converge adopts a listed file that appeared since the last run
+printf 'auto.txt\n' >> "$R1/.lord"
+(cd "$R1" && lord >/dev/null 2>&1)   # refresh exclude for the new entry
+printf 'a\n' > "$R1/auto.txt"
+printf 'more\n' >> "$R1/README.md"
+git -C "$R1" add README.md
+git -C "$R1" commit -qm bump >/dev/null 2>&1
+check "pre-commit adopts new listed file" test -L "$R1/auto.txt"
+check "pre-commit adoption reaches store" test -f "$STORE/auto.txt"
+
+# orphan reporting
+printf 'stray\n' > "$STORE/stray.conf"
+out=$(cd "$R1" && lord 2>&1); st=$?
+check "orphan reported" printf '%s' "$out"
+case $out in *"orphan in store, not in manifest: stray.conf"*) ok "orphan message";; *) bad "orphan message: $out";; esac
+check "orphan does not fail run" test "$st" = 0
+check "orphan not restored to worktree" test ! -e "$R1/stray.conf"
+rm "$STORE/stray.conf"
+
+# --- repo2: fresh clone ------------------------------------------------
+R2="$T/repo2"
+git clone -q "$R1" "$R2"
+git -C "$R2" remote set-url origin https://github.com/acme/app.git
+out=$(cd "$R2" && lord 2>&1); st=$?
+printf -- '--- fresh clone run ---\n%s\n' "$out"
+check "clone run exits 0" test "$st" = 0
+check "clone .lord linked" test -L "$R2/.lord"
+check "clone .env linked" test -L "$R2/.env"
+check "clone .claude linked" test -L "$R2/.claude"
+check "clone nested entry linked" test -L "$R2/nested/dir/token"
+check "clone reads secret through link" grep -q SECRET=1 "$R2/.env"
+check "clone status clean" test -z "$(git -C "$R2" status --porcelain)"
+
+# conflict: real file differs from store
+rm "$R2/.env"
+printf 'SECRET=other\n' > "$R2/.env"
+out=$(cd "$R2" && lord 2>&1); st=$?
+check "conflict exits 17" test "$st" = 17
+case $out in *"conflict: .env in both worktree and store: resolve manually"*) ok "conflict message";; *) bad "conflict message: $out";; esac
+check "conflict leaves worktree file" grep -q SECRET=other "$R2/.env"
+check "conflict leaves store file" grep -q SECRET=1 "$STORE/.env"
+
+# identical copy also refuses, with hint
+printf 'SECRET=1\n' > "$R2/.env"
+out=$(cd "$R2" && lord 2>&1); st=$?
+check "identical conflict exits 17" test "$st" = 17
+case $out in *"(identical)"*) ok "identical hint";; *) bad "identical hint: $out";; esac
+rm "$R2/.env"
+out=$(cd "$R2" && lord 2>&1)
+check "conflict resolved by removing copy" test -L "$R2/.env"
+
+# foreign symlink
+rm "$R2/.env"; ln -s /etc/hostname "$R2/.env"
+out=$(cd "$R2" && lord 2>&1); st=$?
+check "foreign symlink exits 17" test "$st" = 17
+rm "$R2/.env"; (cd "$R2" && lord >/dev/null 2>&1)
+
+# --- repo3: tracked listed path ----------------------------------------
+R3="$T/repo3"
+git init -q -b main "$R3"
+git -C "$R3" remote add origin git@github.com:acme/other.git
+printf 'x\n' > "$R3/config.ini"
+git -C "$R3" add config.ini && git -C "$R3" commit -qm c
+printf 'config.ini\n' > "$R3/.lord"
+out=$(cd "$R3" && lord 2>&1); st=$?
+check "tracked entry exits 1" test "$st" = 1
+case $out in *"E1: tracked in git, refusing to manage: config.ini"*) ok "tracked message";; *) bad "tracked message: $out";; esac
+check "tracked file untouched" test -f "$R3/config.ini" -a ! -L "$R3/config.ini"
+check "manifest still adopted" test -L "$R3/.lord"
+
+# invalid entries
+printf '/abs/path\n../escape\n' >> "$R3/.lord"
+out=$(cd "$R3" && lord 2>&1); st=$?
+check "invalid entry exits 22" test "$st" = 22
+case $out in *"E22: invalid manifest entry: /abs/path"*) ok "invalid abs message";; *) bad "invalid: $out";; esac
+
+# --- no-origin repo -----------------------------------------------------
+R4="$T/repo4"
+git init -q -b main "$R4"
+out=$(cd "$R4" && lord 2>&1); st=$?
+check "no origin: E2" test "$st" = 2
+case $out in E2:*origin*) ok "no-origin message";; *) bad "no-origin message: $out";; esac
+case $out in *"hint: declare one now"*"git remote add origin"*) ok "no-origin hint";; *) bad "no-origin hint: $out";; esac
+
+# --- bootstrap: no manifest anywhere -> init empty one -------------------
+R8="$T/repo8"
+git init -q -b main "$R8"
+git -C "$R8" remote add origin git@github.com:acme/blank.git
+out=$(cd "$R8" && lord 2>&1); st=$?
+check "bootstrap exits 0" test "$st" = 0
+check "bootstrap prints init" test "$out" = "init .lord"
+check "bootstrap .lord is symlink" test -L "$R8/.lord"
+check "bootstrap manifest in store" test -f "$T/store/github.com/acme/blank/.lord"
+check "bootstrap exclude has /.lord" grep -qxF '/.lord' "$R8/.git/info/exclude"
+check "bootstrap hooks installed" test -x "$R8/.git/hooks/pre-commit"
+out=$(cd "$R8" && lord 2>&1); st=$?
+check "bootstrap second run silent+0" test "$st" = 0 -a -z "$out"
+
+# --- not a repo ---------------------------------------------------------
+mkdir -p "$T/plain"
+out=$(cd "$T/plain" && lord 2>&1); st=$?
+check "not a repo: E22" test "$st" = 22
+
+# --- existing hook preserved -------------------------------------------
+R5="$T/repo5"
+git init -q -b main "$R5"
+git -C "$R5" remote add origin git@github.com:acme/hooky.git
+printf '#!/bin/sh\necho husky-stuff\n' > "$R5/.git/hooks/pre-commit"
+chmod +x "$R5/.git/hooks/pre-commit"
+printf '.env\n' > "$R5/.lord"
+(cd "$R5" && lord >/dev/null 2>&1)
+check "existing hook content preserved" grep -q husky-stuff "$R5/.git/hooks/pre-commit"
+check "lord block appended to hook" grep -qxF 'lord' "$R5/.git/hooks/pre-commit"
+(cd "$R5" && lord >/dev/null 2>&1)
+n=$(grep -cxF 'lord' "$R5/.git/hooks/pre-commit")
+check "hook block not duplicated" test "$n" = 1
+
+# post-checkout materializing a listed file -> conflict surfaced
+R6="$T/repo6"
+git init -q -b main "$R6"
+git -C "$R6" remote add origin git@github.com:acme/branchy.git
+printf 'base\n' > "$R6/base.txt"
+git -C "$R6" add -A && git -C "$R6" commit -qm base
+git -C "$R6" checkout -qb feature
+printf 'DBPASS=x\n' > "$R6/creds"
+git -C "$R6" add creds && git -C "$R6" commit -qm creds
+git -C "$R6" checkout -q main
+printf 'creds\n' > "$R6/.lord"
+(cd "$R6" && lord >/dev/null 2>&1)
+out=$(cd "$R6" && git checkout feature 2>&1); st=$?
+case $out in *"E1: tracked in git, refusing to manage: creds"*) ok "post-checkout surfaces tracked conflict";; *) bad "post-checkout: $out";; esac
+
+# --- usage ---------------------------------------------------------------
+out=$(lord --help); st=$?
+check "--help exits 0" test "$st" = 0
+case $out in "usage: lord [-n] [-e] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
+out=$(lord -x 2>&1); st=$?
+check "unknown flag exits 22" test "$st" = 22
+
+# --- xdg fallback: LORD_DIR unset -> XDG_DATA_HOME/lord -----------------
+R7="$T/repo7"
+git init -q -b main "$R7"
+git -C "$R7" remote add origin git@github.com:acme/xdg.git
+printf '.env\n' > "$R7/.lord"
+printf 'x\n' > "$R7/.env"
+(cd "$R7" && env -u LORD_DIR XDG_DATA_HOME="$T/xdg" lord >/dev/null 2>&1)
+check "XDG_DATA_HOME fallback store" test -f "$T/xdg/lord/github.com/acme/xdg/.env"
+check "LORD_DIR wins over XDG_DATA_HOME" test -d "$T/store/github.com/acme/app"
+
+# --- unlisting restores the file -----------------------------------------
+grep -v '^ghost.txt$' "$R1/.lord" > "$T/manifest.tmp"
+cat "$T/manifest.tmp" > "$R1/.lord"   # write through the symlink
+out=$(cd "$R1" && lord 2>&1); st=$?
+check "restore exits 0" test "$st" = 0
+check "restore prints" test "$out" = "restore ghost.txt"
+check "restored as real file" test -f "$R1/ghost.txt" -a ! -L "$R1/ghost.txt"
+check "restored content intact" grep -q boo "$R1/ghost.txt"
+check "store entry gone after restore" test ! -e "$STORE/ghost.txt"
+check "exclude line gone after restore" sh -c "! grep -qxF '/ghost.txt' '$R1/.git/info/exclude'"
+check "restored file visible to git" sh -c "git -C '$R1' status --porcelain | grep -q ghost.txt"
+rm "$R1/ghost.txt"
+
+# nested restore prunes emptied store dirs
+grep -v '^nested/dir/token$' "$R1/.lord" > "$T/manifest.tmp"
+cat "$T/manifest.tmp" > "$R1/.lord"
+out=$(cd "$R1" && lord 2>&1)
+check "nested restore prints" test "$out" = "restore nested/dir/token"
+check "nested restored as real file" test -f "$R1/nested/dir/token" -a ! -L "$R1/nested/dir/token"
+check "emptied store dirs pruned" test ! -d "$STORE/nested"
+
+# unlisted store entry without a worktree symlink stays an orphan
+printf 'keepme\n' > "$STORE/lonely.txt"
+out=$(cd "$R1" && lord 2>&1); st=$?
+case $out in *"orphan in store, not in manifest: lonely.txt"*) ok "orphan without link not restored";; *) bad "orphan without link: $out";; esac
+check "orphan stays in store" test -f "$STORE/lonely.txt"
+check "orphan not placed in worktree" test ! -e "$R1/lonely.txt"
+rm "$STORE/lonely.txt"
+
+# --- skeleton manifest ---------------------------------------------------
+mkdir -p "$T/config"
+printf '.env\n.claude\n' > "$T/config/skel"
+R9="$T/repo9"
+git init -q -b main "$R9"
+git -C "$R9" remote add origin git@github.com:acme/skel.git
+out=$(cd "$R9" && lord 2>&1); st=$?
+check "skel bootstrap exits 0" test "$st" = 0
+check "skel bootstrap prints source" test "$out" = "init .lord (from skel)"
+check "manifest copied from skel" cmp -s "$T/config/skel" "$T/store/github.com/acme/skel/.lord"
+check "skel entry excluded before existing" grep -qxF '/.env' "$R9/.git/info/exclude"
+check "nonexistent skel entry not linked" test ! -e "$R9/.env" -a ! -L "$R9/.env"
+printf 'S=1\n' > "$R9/.env"
+out=$(cd "$R9" && lord 2>&1)
+check "skel entry adopted on appearance" test -L "$R9/.env"
+check "skel entry reaches store" test -f "$T/store/github.com/acme/skel/.env"
+check "manifest diverges freely" sh -c "printf 'extra\n' >> '$R9/.lord' && ! grep -q extra '$T/config/skel'"
+
+# --- dry run --------------------------------------------------------------
+R10="$T/repo10"
+git init -q -b main "$R10"
+git -C "$R10" remote add origin git@github.com:acme/dry.git
+printf 'DB=x\n' > "$R10/.env"
+printf '.env\n' > "$R10/.lord"
+out=$(cd "$R10" && lord -n 2>&1); st=$?
+check "dry run exits 0" test "$st" = 0
+check "dry prints plan" test "$out" = "adopt .lord
+adopt .env"
+check "dry leaves manifest real" test -f "$R10/.lord" -a ! -L "$R10/.lord"
+check "dry leaves file real" test -f "$R10/.env" -a ! -L "$R10/.env"
+check "dry creates no store" test ! -d "$T/store/github.com/acme/dry"
+check "dry installs no hooks" test ! -e "$R10/.git/hooks/pre-commit"
+(cd "$R10" && lord >/dev/null 2>&1)
+out=$(cd "$R10" && lord -n 2>&1); st=$?
+check "dry on converged repo silent+0" test "$st" = 0 -a -z "$out"
+
+# dry init reads the skel without creating anything
+R11="$T/repo11"
+git init -q -b main "$R11"
+git -C "$R11" remote add origin git@github.com:acme/dryinit.git
+printf 'S=1\n' > "$R11/.env"
+out=$(cd "$R11" && lord -n 2>&1)
+check "dry init plans skel adoption" test "$out" = "init .lord (from skel)
+adopt .env"
+check "dry init creates nothing" test ! -e "$R11/.lord" -a ! -d "$T/store/github.com/acme/dryinit"
+
+# --- eject ----------------------------------------------------------------
+R12="$T/repo12"
+git init -q -b main "$R12"
+git -C "$R12" remote add origin git@github.com:acme/ejectme.git
+printf 'S=1\n' > "$R12/.env"
+mkdir -p "$R12/n/d" && printf 'tok\n' > "$R12/n/d/tok"
+printf '.env\nn/d/tok\n' > "$R12/.lord"
+(cd "$R12" && lord >/dev/null 2>&1)
+check "eject setup converged" test -L "$R12/.env"
+out=$(cd "$R12" && lord -e 2>&1); st=$?
+check "eject exits 0" test "$st" = 0
+check "eject prints restores, manifest last" test "$out" = "restore .env
+restore n/d/tok
+restore .lord"
+check "ejected files real" test -f "$R12/.env" -a ! -L "$R12/.env" -a -f "$R12/n/d/tok" -a ! -L "$R12/n/d/tok"
+check "ejected manifest real" test -f "$R12/.lord" -a ! -L "$R12/.lord"
+check "eject removes store dir" test ! -d "$T/store/github.com/acme/ejectme"
+check "eject strips exclude block" sh -c "! grep -q lord-managed '$R12/.git/info/exclude'"
+check "eject removes stub hooks" test ! -e "$R12/.git/hooks/pre-commit" -a ! -e "$R12/.git/hooks/post-merge"
+check "ejected files visible to git" sh -c "git -C '$R12' status --porcelain | grep -q .env"
+out=$(cd "$R12" && lord -e 2>&1); st=$?
+check "second eject silent+0" test "$st" = 0 -a -z "$out"
+
+# eject preserves foreign hook content (repo5 has a husky-style pre-commit)
+(cd "$R5" && lord -e >/dev/null 2>&1)
+check "eject keeps foreign hook lines" grep -q husky-stuff "$R5/.git/hooks/pre-commit"
+check "eject strips lord line from hook" sh -c "! grep -qxF lord '$R5/.git/hooks/pre-commit'"
+
+# --- dangling link sweep ---------------------------------------------------
+# R2 still links ghost.txt and nested/dir/token, both since restored in R1
+out=$(cd "$R2" && lord 2>&1)
+case $out in *"unlisted symlink into lord store: ghost.txt"*) ok "sweep warns dangling ghost";; *) bad "sweep ghost: $out";; esac
+case $out in *"unlisted symlink into lord store: nested/dir/token"*) ok "sweep warns dangling nested";; *) bad "sweep nested: $out";; esac
+ln -s "$STORE/.env" "$R2/stray"
+out=$(cd "$R2" && lord 2>&1)
+case $out in *"unlisted symlink into lord store: stray"*) ok "sweep warns manual stray";; *) bad "sweep stray: $out";; esac
+check "sweep does not remove links" test -L "$R2/stray"
+rm "$R2/stray" "$R2/ghost.txt" "$R2/nested/dir/token"
+
+printf '\n%d ok, %d failed\n' "$pass" "$failn"
+if [ "$failn" = 0 ]; then
+    rm -rf "$T"
+else
+    printf 'workdir kept: %s\n' "$T"
+    exit 1
+fi
