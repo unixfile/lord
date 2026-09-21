@@ -14,6 +14,18 @@ export LORD_CONFIG="$T/config"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
 
+# offline stand-in for the provider APIs: "<url> <provider> <host> <id>"
+# lines in $IDS, the last one wins; an unlisted URL has no id, like an
+# unreachable API
+IDS="$T/ids"
+: > "$IDS"
+cat > "$T/bin/idcmd" <<EOF
+#!/bin/sh
+awk -v u="\$1" '\$1 == u { l = \$2 " " \$3 " " \$4 } END { if (l != "") print l }' "$IDS"
+EOF
+chmod +x "$T/bin/idcmd"
+export LORD_ID_CMD="$T/bin/idcmd"
+
 pass=0 failn=0
 ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
 bad()  { failn=$((failn+1)); printf 'FAIL %s\n' "$*"; }
@@ -223,7 +235,7 @@ case $out in *"E1: tracked in git, refusing to manage: creds"*) ok "post-checkou
 # --- usage ---------------------------------------------------------------
 out=$(lord --help); st=$?
 check "--help exits 0" test "$st" = 0
-case $out in "usage: lord [-n] [-e] [-V] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
+case $out in "usage: lord [-n] [-e] [-i] [-V] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
 out=$(lord -x 2>&1); st=$?
 check "unknown flag exits 22" test "$st" = 22
 out=$(lord -V); st=$?
@@ -354,6 +366,178 @@ out=$(cd "$R2" && lord 2>&1)
 case $out in *"unlisted symlink into lord store: stray"*) ok "sweep warns manual stray";; *) bad "sweep stray: $out";; esac
 check "sweep does not remove links" test -L "$R2/stray"
 rm "$R2/stray" "$R2/ghost.txt" "$R2/nested/dir/token"
+
+# --- identity: .lord-id --------------------------------------------------
+S="$T/store/github.com/acme"
+R13="$T/repo13"
+git init -q -b main "$R13"
+git -C "$R13" remote add origin git@github.com:acme/old.git
+printf 'x\n' > "$R13/f" && git -C "$R13" add f && git -C "$R13" commit -qm c
+root13=$(git -C "$R13" rev-list --max-parents=0 HEAD)
+printf 'S=1\n' > "$R13/.env"
+printf '.env\n' > "$R13/.lord"
+printf 'git@github.com:acme/old.git github github.com 42\n' >> "$IDS"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "id setup exits 0" test "$st" = 0
+check ".lord-id records url" grep -qx 'url git@github.com:acme/old.git' "$S/old/.lord-id"
+check ".lord-id records root" grep -qx "root $root13" "$S/old/.lord-id"
+check ".lord-id records provider id" grep -qx 'id github github.com 42' "$S/old/.lord-id"
+check ".lord-id not linked into worktree" test ! -e "$R13/.lord-id" -a ! -L "$R13/.lord-id"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "id second run silent+0" test "$st" = 0 -a -z "$out"
+out=$(cd "$R13" && lord -i 2>&1); st=$?
+check "-i exits 0" test "$st" = 0
+case $out in *"id    github github.com 42"*"recorded id github github.com 42"*) ok "-i prints live and recorded id";; *) bad "-i output: $out";; esac
+
+# --- rename in place: set-url, then lord moves the store -----------------
+printf 'git@github.com:acme/new.git github github.com 42\n' >> "$IDS"
+git -C "$R13" remote set-url origin git@github.com:acme/new.git
+out=$(cd "$R13" && lord -n 2>&1); st=$?
+check "dry rename exits 0" test "$st" = 0
+check "dry rename prints only the move" test "$out" = "move github.com/acme/old -> github.com/acme/new"
+check "dry rename moves nothing" test -d "$S/old" -a ! -L "$S/old" -a ! -e "$S/new"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "rename exits 0" test "$st" = 0
+check "rename prints move and relinks" test "$out" = "move github.com/acme/old -> github.com/acme/new
+relink .lord
+relink .env"
+check "store moved to new key" test -f "$S/new/.env" -a ! -L "$S/new"
+check "old key forwards to new" test "$(readlink "$S/old")" = "$S/new"
+check "links point at new key" test "$(readlink "$R13/.env")" = "$S/new/.env"
+check "file readable after rename" grep -q S=1 "$R13/.env"
+check ".lord-id url follows rename" grep -qx 'url git@github.com:acme/new.git' "$S/new/.lord-id"
+check ".lord-id keeps id" grep -qx 'id github github.com 42' "$S/new/.lord-id"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "after rename silent+0" test "$st" = 0 -a -z "$out"
+
+# a clone still on the old URL keeps working through the forward
+R14="$T/repo14"
+git clone -q "$R13" "$R14"
+git -C "$R14" remote set-url origin git@github.com:acme/old.git
+out=$(cd "$R14" && lord 2>&1); st=$?
+check "old-URL clone exits 0" test "$st" = 0
+check "old-URL clone links, never moves" test "$out" = "link .lord
+link .env"
+check "old-URL clone reads the file" grep -q S=1 "$R14/.env"
+check "store stays at new key" test -d "$S/new" -a ! -L "$S/new" -a -L "$S/old"
+check "old-URL clone leaves the record alone" grep -qx 'url git@github.com:acme/new.git' "$S/new/.lord-id"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "new-URL clone unaffected, silent+0" test "$st" = 0 -a -z "$out"
+
+# a fresh clone under a newer name finds the store by id alone
+printf 'git@github.com:acme/newer.git github github.com 42\n' >> "$IDS"
+R15="$T/repo15"
+git clone -q "$R13" "$R15"
+git -C "$R15" remote set-url origin git@github.com:acme/newer.git
+out=$(cd "$R15" && lord 2>&1); st=$?
+check "fresh clone after rename exits 0" test "$st" = 0
+check "fresh clone moves by id and links" test "$out" = "move github.com/acme/new -> github.com/acme/newer
+link .lord
+link .env"
+check "fresh clone reads the file" grep -q S=1 "$R15/.env"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "earlier clone follows the chain" test "$st" = 0 -a -z "$out"
+check "earlier clone still reads the file" grep -q S=1 "$R13/.env"
+
+# --- a fork or copy: other id, same history -> never takes the store -----
+R16="$T/repo16"
+git clone -q "$R13" "$R16"
+git -C "$R16" remote set-url origin git@github.com:acme/newer.git
+(cd "$R16" && lord >/dev/null 2>&1)
+printf 'git@github.com:someone/fork.git github github.com 99\n' >> "$IDS"
+git -C "$R16" remote set-url origin git@github.com:someone/fork.git
+out=$(cd "$R16" && lord 2>&1); st=$?
+check "fork refuses with 17" test "$st" = 17
+case $out in *"move "*) bad "fork moved the store: $out";; *) ok "fork does not move";; esac
+check "fork leaves upstream store" test -f "$S/newer/.env"
+check "no store under fork key" test ! -e "$T/store/github.com/someone/fork"
+git -C "$R16" remote set-url origin git@github.com:acme/newer.git
+
+# --- offline: no id, move only on the checkout's own link ---------------
+R17="$T/repo17"
+git init -q -b main "$R17"
+git -C "$R17" remote add origin git@gitea.example:me/off.git
+printf 'y\n' > "$R17/g" && git -C "$R17" add g && git -C "$R17" commit -qm c
+printf 'T=1\n' > "$R17/.env"
+printf '.env\n' > "$R17/.lord"
+(cd "$R17" && lord >/dev/null 2>&1)
+check "offline store records id none" grep -qx 'id none' "$T/store/gitea.example/me/off/.lord-id"
+git -C "$R17" remote set-url origin git@gitea.example:me/on.git
+out=$(cd "$R17" && lord 2>&1); st=$?
+check "offline rename exits 0" test "$st" = 0
+check "offline rename moves by link" test "$out" = "move gitea.example/me/off -> gitea.example/me/on
+relink .lord
+relink .env"
+check "offline rename reads the file" grep -q T=1 "$R17/.env"
+# a fresh clone with no id and no link has nothing to go on
+R18="$T/repo18"
+git clone -q "$R17" "$R18"
+git -C "$R18" remote set-url origin git@gitea.example:me/elsewhere.git
+out=$(cd "$R18" && lord 2>&1); st=$?
+check "unprovable clone exits 0" test "$st" = 0
+case $out in "init .lord"*) ok "unprovable clone gets a new store";; *) bad "unprovable clone: $out";; esac
+check "unprovable clone leaves the store" test -f "$T/store/gitea.example/me/on/.env"
+
+# recorded id, but the lookup fails now: no move, a warning
+git -C "$R15" remote set-url origin git@github.com:acme/offline.git
+out=$(cd "$R15" && lord 2>&1); st=$?
+case $out in *"cannot look up the repo id"*"unverified"*) ok "unverified move warns";; *) bad "unverified warn: $out";; esac
+check "unverified move exits 17" test "$st" = 17
+check "unverified move keeps the store" test -f "$S/newer/.env" -a ! -e "$S/offline"
+git -C "$R15" remote set-url origin git@github.com:acme/newer.git
+
+# --- two stores with the same id: refuse, never guess ------------------
+mkdir -p "$S/dup" && printf '.env\n' > "$S/dup/.lord"
+printf 'url x\nid github github.com 42\n' > "$S/dup/.lord-id"
+R19="$T/repo19"
+git clone -q "$R13" "$R19"
+printf 'git@github.com:acme/third.git github github.com 42\n' >> "$IDS"
+git -C "$R19" remote set-url origin git@github.com:acme/third.git
+out=$(cd "$R19" && lord 2>&1); st=$?
+check "ambiguous id exits 17" test "$st" = 17
+case $out in *"several stores carry this repo's id"*) ok "ambiguous id message";; *) bad "ambiguous: $out";; esac
+check "ambiguous id moves nothing" test -f "$S/newer/.env" -a -d "$S/dup" -a ! -e "$S/third"
+rm -r "$S/dup"
+
+# --- a store moved by hand: dangling links are re-pointed ---------------
+mv "$T/store/gitea.example/me/on" "$T/store/gitea.example/me/hand"
+git -C "$R17" remote set-url origin git@gitea.example:me/hand.git
+out=$(cd "$R17" && lord 2>&1); st=$?
+check "manual move exits 0" test "$st" = 0
+check "manual move relinks" test "$out" = "relink .lord
+relink .env"
+check "manual move reads the file" grep -q T=1 "$R17/.env"
+
+# --- a new repo under a forwarded name gets its own store ----------------
+printf 'git@github.com:acme/old.git github github.com 77\n' >> "$IDS"
+R20="$T/repo20"
+git init -q -b main "$R20"
+git -C "$R20" remote add origin git@github.com:acme/old.git
+printf 'other\n' > "$R20/h" && git -C "$R20" add h && git -C "$R20" commit -qm other
+out=$(cd "$R20" && lord 2>&1); st=$?
+check "new repo on old name exits 0" test "$st" = 0
+case $out in *"forwarded to"*"different repo; dropping the forward"*"init .lord"*) ok "stale forward dropped";; *) bad "stale forward: $out";; esac
+check "old name is a real store again" test -d "$S/old" -a ! -L "$S/old"
+check "renamed repo's store untouched" test -f "$S/newer/.env"
+
+# --- reserved name ---------------------------------------------------------
+printf '.lord-id\n' >> "$R13/.lord"
+out=$(cd "$R13" && lord 2>&1); st=$?
+check "listing .lord-id exits 22" test "$st" = 22
+case $out in *"reserved for lord's own metadata: .lord-id"*) ok "reserved name message";; *) bad "reserved: $out";; esac
+grep -vxF '.lord-id' "$R13/.lord" > "$T/manifest.tmp"
+cat "$T/manifest.tmp" > "$R13/.lord"
+
+# --- eject removes the record with the store ---------------------------
+R21="$T/repo21"
+git init -q -b main "$R21"
+git -C "$R21" remote add origin git@github.com:acme/gone.git
+printf 'G=1\n' > "$R21/.env" && printf '.env\n' > "$R21/.lord"
+(cd "$R21" && lord >/dev/null 2>&1)
+check "record written before eject" test -f "$S/gone/.lord-id"
+out=$(cd "$R21" && lord -e 2>&1); st=$?
+check "eject with record exits 0" test "$st" = 0
+check "eject removes store and record" test ! -e "$S/gone"
 
 printf '\n%d ok, %d failed\n' "$pass" "$failn"
 if [ "$failn" = 0 ]; then

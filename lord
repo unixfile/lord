@@ -9,32 +9,44 @@
 # .git/info/exclude, installs hooks, and reports conflicts instead of
 # guessing. A repo with no manifest anywhere gets one initialized in the
 # store and linked, copied from the config skel if that file exists.
-# The only destructive operation is the adoption rename. With nothing to do
-# it prints nothing and exits 0.
+# Each store also holds .lord-id, never linked: the origin URL, the root
+# commit and the hosting provider's repo id. When the store for the origin
+# URL is missing, lord finds the one that belongs to this repo by that id
+# and moves it, so a renamed or transferred repo keeps its files.
+# The only destructive operations are the adoption rename and that move.
+# With nothing to do it prints nothing and exits 0.
 #
 # Environment:
 #   LORD_DIR         store root; default $XDG_DATA_HOME/lord
-#   LORD_CONFIG      config dir holding skel; default $XDG_CONFIG_HOME/lord
+#   LORD_CONFIG      config dir holding skel and hosts; default $XDG_CONFIG_HOME/lord
+#   LORD_ID_CMD      command that prints "<provider> <host> <id>" for the URL
+#                    in $1, replacing the built-in API lookups
 #   XDG_DATA_HOME    default $HOME/.local/share
 #   XDG_CONFIG_HOME  default $HOME/.config
+#   GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN GITEA_TOKEN FORGEJO_TOKEN
+#   BITBUCKET_TOKEN AZURE_DEVOPS_PAT SRHT_TOKEN
+#                    API tokens for private repos, per provider
 
 # shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -eu
 
-VERSION='1.0'
+VERSION='1.1'
 LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
 LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
 MARKER='# lord-managed'
 MANIFEST='.lord'
+META='.lord-id'
 
 rc=0
 dry=
 eject=
+ident=
 mfile=
+repo_id=
 
 usage() {
     cat <<'EOF'
-usage: lord [-n] [-e] [-V] [dir]
+usage: lord [-n] [-e] [-i] [-V] [dir]
 
 Converge the git repo at dir (default: current directory) to its .lord
 manifest. .lord lists one literal path per line; each listed file lives in
@@ -48,10 +60,13 @@ With nothing to do it prints nothing and exits 0.
   -n  dry run: report what a run would do, change nothing
   -e  eject: move every managed file back into the worktree, remove the
       exclude and hook blocks, and delete the repo's store dir if emptied
+  -i  identity: print the origin URL, store key, root commit and the
+      provider's repo id, looked up now; change nothing
   -V  print version
 
 store:  $LORD_DIR, default $XDG_DATA_HOME/lord (~/.local/share/lord),
-        keyed by the origin URL: <host>/<owner>/<repo>
+        keyed by the origin URL: <host>/<owner>/<repo>. A missing store is
+        found again by the repo id, so renames and transfers carry over.
 config: $LORD_CONFIG, default $XDG_CONFIG_HOME/lord (~/.config/lord)
 EOF
 }
@@ -117,6 +132,310 @@ tracked() {
     [ -n "$(git -C "$proj" ls-files --cached -- ":(literal)$1" 2>/dev/null)" ]
 }
 
+# git@host:owner/repo.git and scheme://user@host/owner/repo.git both
+# become host/owner/repo
+urlkey() {
+    local k="$1"
+    k=${k#*://}
+    k=${k#*@}
+    case $k in *:*) k="${k%%:*}/${k#*:}" ;; esac
+    k=${k%/}
+    printf '%s\n' "${k%.git}"
+}
+
+# Print the scalar value of key $1 in the JSON on stdin: at the top level,
+# or at any depth when $2 is set. Strings print unescaped of their quotes,
+# numbers as written; objects, arrays and null print nothing.
+json_get() {
+    awk -v k="$1" -v any="${2-}" '
+    { buf = buf $0 "\n" }
+    END {
+        n = length(buf); d = 0; want = 0; i = 1
+        while (i <= n) {
+            c = substr(buf, i, 1)
+            if (c == "\"") {
+                s = ""; j = i + 1
+                while (j <= n) {
+                    ch = substr(buf, j, 1)
+                    if (ch == "\\") { s = s substr(buf, j + 1, 1); j += 2; continue }
+                    if (ch == "\"") break
+                    s = s ch; j++
+                }
+                i = j + 1
+                if (want) { print s; exit }
+                m = i
+                while (substr(buf, m, 1) ~ /[ \t\r\n]/) m++
+                if (substr(buf, m, 1) == ":" && s == k && (d == 1 || any != "")) {
+                    want = 1; i = m + 1
+                }
+                continue
+            }
+            if (want && c ~ /[-0-9]/) {
+                v = ""
+                while (substr(buf, i, 1) ~ /[-+0-9.eE]/) { v = v substr(buf, i, 1); i++ }
+                print v; exit
+            }
+            if (want && c ~ /[[{tfn]/) exit
+            if (c == "{" || c == "[") d++
+            else if (c == "}" || c == "]") d--
+            i++
+        }
+    }'
+}
+
+# api_get <auth> <token> <curl args...>: fetch JSON. The token reaches curl
+# through its config on stdin, so it never shows in the process list.
+api_get() {
+    local auth="$1" tok="$2"
+    shift 2
+    {
+        if [ -n "$tok" ]; then
+            case $auth in
+                bearer) printf 'header = "Authorization: Bearer %s"\n' "$tok" ;;
+                token)  printf 'header = "Authorization: token %s"\n' "$tok" ;;
+                basic)  printf 'user = ":%s"\n' "$tok" ;;
+            esac
+        fi
+    } | curl -fsSL --max-time 10 -H 'Accept: application/json' -K - "$@" 2>/dev/null
+}
+
+# Print "<provider> <host> <id>" for the hosted repo at URL $1, or nothing
+# when the host is unknown, the API is unreachable or the repo is private
+# and no token is set. Well-known hosts are built in; $LORD_CONFIG/hosts
+# adds self-hosted ones as "<host> <provider> [api-base]" lines.
+resolve_id() {
+    local url="$1" k host path prov='' base='' h p b api field=id any='' auth=bearer tok='' id
+    local org proj repo
+
+    if [ -n "${LORD_ID_CMD:-}" ]; then
+        "$LORD_ID_CMD" "$url" 2>/dev/null || :
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || return 0
+
+    k=$(urlkey "$url")
+    host=${k%%/*} path=${k#*/}
+    case $host in
+        github.com)                   prov=github ;;
+        gitlab.com)                   prov=gitlab ;;
+        codeberg.org)                 prov=forgejo ;;
+        bitbucket.org)                prov=bitbucket ;;
+        dev.azure.com|ssh.dev.azure.com) prov=azure ;;
+        git.sr.ht)                    prov=sourcehut ;;
+    esac
+    if [ -f "$LORD_CONFIG/hosts" ]; then
+        while read -r h p b; do
+            case $h in ''|'#'*) continue ;; esac
+            if [ "$h" = "$host" ]; then prov=$p base=${b:-}; fi
+        done < "$LORD_CONFIG/hosts"
+    fi
+
+    case $prov in
+        github)
+            [ "$host" = github.com ] && base=${base:-https://api.github.com}
+            api="${base:-https://$host/api/v3}/repos/$path"
+            tok=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+            if [ -z "$tok" ] && command -v gh >/dev/null 2>&1; then
+                tok=$(gh auth token --hostname "$host" 2>/dev/null) || tok=
+            fi ;;
+        gitlab)
+            api="${base:-https://$host/api/v4}/projects/$(printf '%s' "$path" | sed 's|/|%2F|g')"
+            tok=${GITLAB_TOKEN:-} ;;
+        gitea|forgejo)
+            api="${base:-https://$host/api/v1}/repos/$path"
+            tok=${GITEA_TOKEN:-${FORGEJO_TOKEN:-}} auth=token ;;
+        bitbucket)
+            api="${base:-https://api.bitbucket.org/2.0}/repositories/$path"
+            field=uuid tok=${BITBUCKET_TOKEN:-} ;;
+        bitbucket-dc)
+            # clone paths end in <project>/<slug>, after scm/ or a port
+            repo=${path##*/} proj=${path%/*} proj=${proj##*/}
+            api="${base:-https://$host/rest/api/1.0}/projects/$proj/repos/$repo"
+            tok=${BITBUCKET_TOKEN:-} ;;
+        azure)
+            # https: <org>/<project>/_git/<repo>; ssh: v3/<org>/<project>/<repo>
+            case $path in
+                v3/*/*/*) path=${path#v3/} org=${path%%/*} repo=${path##*/}
+                          proj=${path#*/} proj=${proj%/*} ;;
+                */*/_git/*) org=${path%%/*} repo=${path##*/}
+                            proj=${path#*/} proj=${proj%%/*} ;;
+                *) return 0 ;;
+            esac
+            host=dev.azure.com
+            api="${base:-https://dev.azure.com}/$org/$proj/_apis/git/repositories/$repo?api-version=7.1"
+            tok=${AZURE_DEVOPS_PAT:-} auth=basic ;;
+        sourcehut)
+            # the GraphQL API answers nobody without a token, public repos included
+            tok=${SRHT_TOKEN:-}
+            [ -n "$tok" ] || return 0
+            path=${path#\~}
+            id=$(api_get bearer "$tok" -H 'Content-Type: application/json' \
+                --data "{\"query\":\"{ user(username: \\\"${path%%/*}\\\") { repository(name: \\\"${path#*/}\\\") { rid } } }\"}" \
+                "${base:-https://$host}/query" | json_get rid any) || id=
+            [ -z "$id" ] || printf '%s %s %s\n' "$prov" "$host" "$id"
+            return 0 ;;
+        *) return 0 ;;
+    esac
+    id=$(api_get "$auth" "$tok" "$api" | json_get "$field" "$any") || id=
+    [ -z "$id" ] || printf '%s %s %s\n' "$prov" "$host" "$id"
+}
+
+# Look up this repo's id once per run; none when it cannot be had.
+lookup_id() {
+    [ -z "$repo_id" ] || return 0
+    repo_id=$(resolve_id "$remote")
+    [ -n "$repo_id" ] || repo_id=none
+}
+
+# The oldest root commit, so every clone of the same history agrees.
+root_commit() {
+    git -C "$proj" rev-list --max-parents=0 HEAD 2>/dev/null | sort | head -n 1
+}
+
+# meta_get <file> <field>: one value from a .lord-id file, or nothing.
+meta_get() {
+    [ -f "$1" ] || return 0
+    awk -v k="$2" '$1 == k { sub(/^[^ ]+ /, ""); print; exit }' "$1"
+}
+
+# Record who this store belongs to. Local fields are refreshed every run;
+# the provider id is looked up only when none is recorded yet, so hooks stay
+# offline. A failed lookup records none; delete the file to retry.
+write_meta() {
+    local f="$store/$META" root url id oldroot tmp
+    root=$(root_commit)
+    url=$(meta_get "$f" url)
+    id=$(meta_get "$f" id)
+    oldroot=$(meta_get "$f" root)
+    [ -n "$id" ] || lookup_id
+    if [ -z "$id" ] || { [ "$id" = none ] && [ -n "$repo_id" ] && [ "$repo_id" != none ]; }; then
+        id=$repo_id
+    fi
+    [ -n "$root" ] || root=$oldroot
+    if [ -f "$f" ] && [ "$url" = "$remote" ] && [ "$oldroot" = "$root" ] \
+        && [ "$id" = "$(meta_get "$f" id)" ]; then
+        return 0
+    fi
+    tmp="$f.tmp"
+    {
+        printf 'url %s\n' "$remote"
+        [ -z "$root" ] || printf 'root %s\n' "$root"
+        printf 'id %s\n' "$id"
+    } > "$tmp"
+    mv "$tmp" "$f"
+}
+
+# The store for the origin URL is missing: find the store this repo used
+# before a rename or transfer and move it into place. A store qualifies when
+# it carries this repo's provider id, or when this checkout's manifest still
+# links into it and nothing recorded there says it is another repo: no other
+# id, no other root commit. A different id means a fork or a copy, which
+# keeps its own store. Several stores with this id is an error, never a guess.
+# The move leaves a symlink at the old key, so clones still on the old URL,
+# which the host keeps redirecting, share the store instead of moving it back.
+relocate() {
+    local t linked='' f dir root sid sroot hit='' n=0 list=''
+
+    # a forward left by an earlier move: follow it, unless a different
+    # history now answers at this URL, eg a new repo under the old name
+    if [ -L "$store" ]; then
+        t=$(readlink "$store")
+        root=$(root_commit)
+        sroot=$(meta_get "$t/$META" root)
+        if [ -z "$root" ] || [ -z "$sroot" ] || [ "$root" = "$sroot" ]; then
+            return 0
+        fi
+        warn "${store#"$LORD_DATA/"} forwarded to ${t#"$LORD_DATA/"}, a different repo; dropping the forward"
+        [ -n "$dry" ] || rm "$store"
+    fi
+    [ ! -e "$store" ] || return 0
+    [ -d "$LORD_DATA" ] || return 0
+
+    if [ -L "$proj/$MANIFEST" ]; then
+        t=$(readlink "$proj/$MANIFEST")
+        case $t in
+            "$LORD_DATA"/*/"$MANIFEST") [ ! -f "$t" ] || linked=${t%/"$MANIFEST"} ;;
+        esac
+    fi
+
+    lookup_id
+    if [ "$repo_id" != none ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            dir=${f%/*}
+            [ -f "$dir/$MANIFEST" ] || continue
+            [ "$(meta_get "$f" id)" = "$repo_id" ] || continue
+            n=$((n + 1)) hit=$dir list="$list ${dir#"$LORD_DATA/"}"
+        done <<EOF
+$(find "$LORD_DATA" -name "$META" -type f 2>/dev/null)
+EOF
+    fi
+    [ "$n" -le 1 ] || error 17 "several stores carry this repo's id ($repo_id):$list"
+
+    if [ "$n" = 0 ] && [ -n "$linked" ]; then
+        root=$(root_commit)
+        sid=$(meta_get "$linked/$META" id)
+        sroot=$(meta_get "$linked/$META" root)
+        if [ -n "$root" ] && [ -n "$sroot" ] && [ "$root" != "$sroot" ]; then
+            :
+        elif [ -z "$sid" ] || [ "$sid" = none ]; then
+            n=1 hit=$linked
+        elif [ "$repo_id" = none ]; then
+            warn "cannot look up the repo id for $remote, so the move from ${linked#"$LORD_DATA/"} is unverified; rerun online or with a token"
+        fi
+    fi
+    [ "$n" = 1 ] || return 0
+
+    printf 'move %s -> %s\n' "${hit#"$LORD_DATA/"}" "$key"
+    if [ -n "$dry" ]; then
+        # plan against the store where it still is
+        store=$hit
+        return 0
+    fi
+    mkdir -p "${store%/*}"
+    mv "$hit" "$store"
+    ln -s "$store" "$hit"
+}
+
+# same_entry <a> <b>: both paths name one store entry, eg through a forward.
+# Compares the physical parent dirs, since test -ef is not POSIX.
+same_entry() {
+    local a b
+    [ "${1##*/}" = "${2##*/}" ] || return 1
+    a=$(cd -P -- "${1%/*}" 2>/dev/null && pwd -P) || return 1
+    b=$(cd -P -- "${2%/*}" 2>/dev/null && pwd -P) || return 1
+    [ "$a" = "$b" ]
+}
+
+# stale <target> <expected>: the link points into the lord store but not at
+# the expected path, and re-pointing loses nothing: the old target is either
+# missing while the right entry exists, as after a store moved by hand, or
+# the very same entry reached through the forward a move leaves behind.
+stale() {
+    case $1 in "$LORD_DATA"/*) ;; *) return 1 ;; esac
+    same_entry "$1" "$2" && return 0
+    [ ! -e "$1" ] && [ ! -L "$1" ] && { [ -e "$2" ] || [ -L "$2" ]; }
+}
+
+relink() {
+    printf 'relink %s\n' "$1"
+    [ -z "$dry" ] || return 0
+    rm "$proj/$1"
+    ln -s "$store/$1" "$proj/$1"
+}
+
+show_id() {
+    local f="$store/$META"
+    lookup_id
+    printf 'url   %s\nkey   %s\nroot  %s\nid    %s\n' "$remote" "$key" "$(root_commit)" "$repo_id"
+    if [ -f "$f" ]; then
+        printf 'store %s (recorded id %s)\n' "$store" "$(meta_get "$f" id)"
+    else
+        printf 'store %s (no %s yet)\n' "$store" "$META"
+    fi
+    exit 0
+}
+
 # Parse the manifest at $1 into $entries and the exclude block $excl.
 read_entries() {
     local line
@@ -128,6 +447,11 @@ read_entries() {
         case $line in ''|'#'*) continue ;; esac
         line=${line%/}
         case $line in "$MANIFEST") continue ;; esac
+        case $line in
+            "$META")
+                fail 22 "reserved for lord's own metadata: $line"
+                continue ;;
+        esac
         case $line in
             /*|..|../*|*/..|*/../*)
                 fail 22 "invalid manifest entry: $line"
@@ -147,8 +471,15 @@ converge_manifest() {
 
     if [ -L "$w" ]; then
         target=$(readlink "$w")
-        [ "$target" = "$s" ] \
-            || error 17 "conflict: $MANIFEST is a symlink to $target, expected $s"
+        if [ "$target" != "$s" ]; then
+            stale "$target" "$s" \
+                || error 17 "conflict: $MANIFEST is a symlink to $target, expected $s"
+            relink "$MANIFEST"
+            if [ -n "$dry" ]; then
+                mfile=$s
+                return 0
+            fi
+        fi
         [ -f "$s" ] || error 2 "manifest missing from store: $s"
         mfile=$w
         return 0
@@ -218,6 +549,8 @@ process_entry() {
         target=$(readlink "$w")
         if [ "$target" = "$s" ]; then
             [ -e "$s" ] || warn "store entry missing behind link: $entry"
+        elif stale "$target" "$s"; then
+            relink "$entry"
         else
             fail 17 "conflict: $entry is a symlink to $target, expected $s"
         fi
@@ -266,7 +599,7 @@ sweep_store() {
     for path in "$store/$dir".[!.]* "$store/$dir"*; do
         { [ -e "$path" ] || [ -L "$path" ]; } || continue
         rel=${path#"$store/"}
-        case $rel in "$MANIFEST") continue ;; esac
+        case $rel in "$MANIFEST"|"$META"|"$META.tmp") continue ;; esac
         covered=none
         while IFS= read -r entry; do
             [ -n "$entry" ] || continue
@@ -366,6 +699,7 @@ EOF
     fi
 
     if [ -z "$dry" ]; then
+        rm -f "$store/$META"
         defence "$gitdir/info/exclude"
         remove_hook pre-commit
         remove_hook post-checkout
@@ -393,11 +727,12 @@ main() {
         --help)    usage; exit 0 ;;
         --version) printf 'lord %s\n' "$VERSION"; exit 0 ;;
     esac
-    while getopts :hneV opt; do
+    while getopts :hneiV opt; do
         case $opt in
             h) usage; exit 0 ;;
             n) dry=1 ;;
             e) eject=1 ;;
+            i) ident=1 ;;
             V) printf 'lord %s\n' "$VERSION"; exit 0 ;;
             ?) error 22 "unknown flag: -$OPTARG" ;;
         esac
@@ -414,16 +749,12 @@ main() {
         || error 2 "no remote named origin: lord keys its store by the origin URL
 hint: declare one now, it need not exist yet: git remote add origin git@github.com:<owner>/<repo>.git"
 
-    # git@host:owner/repo.git and scheme://user@host/owner/repo.git
-    # both become host/owner/repo
-    key=${remote#*://}
-    key=${key#*@}
-    case $key in *:*) key="${key%%:*}/${key#*:}" ;; esac
-    key=${key%/}
-    key=${key%.git}
+    key=$(urlkey "$remote")
     store="$LORD_DATA/$key"
 
-    [ -n "$eject" ] && eject_repo
+    [ -z "$ident" ] || show_id
+    relocate
+    [ -z "$eject" ] || eject_repo
 
     converge_manifest
     read_entries "$mfile"
@@ -450,6 +781,12 @@ EOF
 
     sweep_store ''
     sweep_links
+
+    # a clone reaching the store through a forward leaves the record to the
+    # clone on the current URL, so the two never rewrite it back and forth
+    if [ -z "$dry" ] && [ ! -L "$store" ] && [ -f "$store/$MANIFEST" ]; then
+        write_meta
+    fi
 
     exit "$rc"
 }
