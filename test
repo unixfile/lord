@@ -69,6 +69,17 @@ out=$(cd "$R1" && lord 2>&1); st=$?
 check "second run silent" test -z "$out"
 check "second run exits 0" test "$st" = 0
 
+# an unchanged hook or exclude is left alone, so lord still runs where
+# they can't be written, such as a sandbox that protects .git/hooks
+ro="$R1/.git/hooks/pre-commit $R1/.git/hooks/post-checkout $R1/.git/hooks/post-merge $R1/.git/info/exclude"
+# shellcheck disable=SC2086
+chmod a-w $ro
+out=$(cd "$R1" && lord 2>&1); st=$?
+check "run with read-only hooks and exclude exits 0" test "$st" = 0
+check "run with read-only hooks and exclude silent" test -z "$out"
+# shellcheck disable=SC2086
+chmod u+w $ro
+
 # ghost.txt appears later -> already ignored, adopted on next run
 printf 'boo\n' > "$R1/ghost.txt"
 check "ghost.txt ignored before adoption" test -z "$(git -C "$R1" status --porcelain)"
