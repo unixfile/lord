@@ -76,6 +76,7 @@ fail()  { local code="$1"; shift; printf 'E%d: %s\n' "$code" "$*" >&2; [ "$rc" !
 warn()  { printf 'warn: %s\n' "$*" >&2; }
 
 # Replace the lord-managed fenced block in $1 with stdin, appending if absent.
+# $1 is only written when that changes it.
 fence() {
     local dst="$1" tmp
     tmp=$(mktemp)
@@ -91,7 +92,7 @@ fence() {
         cat
         printf '%s end\n' "$MARKER"
     } >> "$tmp"
-    cat "$tmp" > "$dst"
+    cmp -s "$tmp" "$dst" || cat "$tmp" > "$dst"
     rm -f "$tmp"
 }
 
@@ -105,7 +106,7 @@ defence() {
         skip { if ($0 == m " end") skip = 0; next }
         { print }
     ' "$dst" > "$tmp"
-    cat "$tmp" > "$dst"
+    cmp -s "$tmp" "$dst" || cat "$tmp" > "$dst"
     rm -f "$tmp"
 }
 
