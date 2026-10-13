@@ -63,7 +63,7 @@ usage: lord [-n] [-e] [-i] [-V] [dir]
       provider's repo id, looked up now; change nothing
   -V  print version
   -a  converge every checkout in the registry, see Checkouts
-  -l  list the registry, see Checkouts
+  -l  list the registry: state, age or ISO time, path; see Checkouts
 ```
 
 dir defaults to the current directory and may be anywhere inside the repo.
@@ -172,9 +172,20 @@ belong to one machine.
 
 ```
 $ lord -l
-ok     2026-10-13T14:11:55Z  /home/t/src/app
-drift  2026-10-12T09:30:02Z  /home/t/src/api
-dead   2026-09-30T17:45:10Z  /home/t/src/old
+drift  1d   ~/src/api
+ok     5m   ~/src/app
+dead   9w   ~/src/old
+```
+
+On a terminal the rows are sorted by path and `$HOME` shows as `~`. The
+second column is the age of the last run: `now`, `12m`, `5h`, `6d`, `9w` or
+`2y`. In a pipe or a `$(...)` the output is for scripts instead: three tab
+separated fields in registry order, newest first, with the UTC time in ISO
+form and the absolute path last.
+
+```
+$ lord -l | cat
+ok	2026-10-13T14:11:55Z	/home/t/src/app
 ```
 
 The state column reads:
@@ -249,7 +260,7 @@ curl for id lookups.
 make check
 ```
 
-Runs the end-to-end suite: 233 checks across adoption, fresh clones,
+Runs the end-to-end suite: 240 checks across adoption, fresh clones,
 conflicts, hooks, eject, dry runs, renames, store moves and the registry. Id lookups run
 offline through `LORD_ID_CMD`.
 

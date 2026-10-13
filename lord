@@ -78,7 +78,9 @@ With nothing to do it prints nothing and exits 0.
       checkout that had something to report; a path that is no longer a
       lord checkout is dropped from the registry; with -n, change nothing
   -l  list the registry: ok, drift, error or dead, the time of the last
-      run and the path
+      run and the path; on a terminal the rows are sorted by path, the time
+      is an age and $HOME shows as ~, otherwise the rows keep registry order
+      and the fields are tab separated with the time in ISO
 
 store:  $LORD_DIR, default $XDG_DATA_HOME/lord (~/.local/share/lord),
         keyed by the origin URL: <host>/<owner>/<repo>. A missing store is
@@ -487,11 +489,39 @@ live() {
     [ -f "$LORD_DATA/$(urlkey "$url")/$MANIFEST" ]
 }
 
-# -l: one line per registered checkout. The state comes from a dry run in a
-# child process, which can fail without ending this one. Drift is anything
-# the dry run would do, and every action prints on stdout. Warnings go to
-# stderr and do not count.
-list_checkouts() {
+# age_of <iso> <now>: how long ago the UTC time $1 was, as one short unit:
+# now, 12m, 5h, 6d, 9w or 2y. The date arithmetic runs in awk, since the
+# options of date to parse a time differ between GNU and BSD.
+age_of() {
+    awk -v t="$1" -v n="$2" '
+    function days(y, m, d,   era, yoe, doy) {
+        if (m <= 2) y--
+        era = int(y / 400)
+        yoe = y - era * 400
+        doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+        return era * 146097 + yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+    }
+    function secs(x) {
+        return days(substr(x, 1, 4) + 0, substr(x, 6, 2) + 0, substr(x, 9, 2) + 0) * 86400 \
+            + substr(x, 12, 2) * 3600 + substr(x, 15, 2) * 60 + substr(x, 18, 2)
+    }
+    BEGIN {
+        a = secs(n) - secs(t)
+        if (a < 60)              print "now"
+        else if (a < 3600)       print int(a / 60) "m"
+        else if (a < 86400)      print int(a / 3600) "h"
+        else if (a < 14 * 86400) print int(a / 86400) "d"
+        else if (a < 365 * 86400) print int(a / (7 * 86400)) "w"
+        else                     print int(a / (365 * 86400)) "y"
+    }'
+}
+
+# list_rows: one tab separated row per registered checkout: state, time of the
+# last run in ISO, path. The state comes from a dry run in a child process,
+# which can fail without ending this one. Drift is anything the dry run would
+# do, and every action prints on stdout. Warnings go to stderr and do not
+# count.
+list_rows() {
     local f="$LORD_STATE/checkouts" line t p st out state
     [ -f "$f" ] || return 0
     while IFS= read -r line; do
@@ -509,8 +539,34 @@ list_checkouts() {
         else
             state=dead
         fi
-        printf '%-5s  %s  %s\n' "$state" "$t" "$p"
+        printf '%s\t%s\t%s\n' "$state" "$t" "$p"
     done < "$f"
+}
+
+# render_rows: list_rows for a person. The time becomes an age, $HOME becomes
+# ~ and the columns align.
+render_rows() {
+    local tab state t p now
+    tab=$(printf '\t')
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    while IFS=$tab read -r state t p; do
+        if [ -n "${HOME:-}" ]; then
+            case $p in "$HOME"/*) p="~${p#"$HOME"}" ;; esac
+        fi
+        printf '%-5s  %-3s  %s\n' "$state" "$(age_of "$t" "$now")" "$p"
+    done
+}
+
+# -l: on a terminal the rows are sorted by path and rendered. Anywhere else
+# they stay in registry order, newest first, for scripts to read.
+list_checkouts() {
+    local tab
+    if [ -t 1 ]; then
+        tab=$(printf '\t')
+        list_rows | LC_ALL=C sort -t "$tab" -k 3 | render_rows
+    else
+        list_rows
+    fi
 }
 
 # -a: run lord in every registered checkout. Each runs as a child, so one
