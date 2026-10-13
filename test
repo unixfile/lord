@@ -278,7 +278,7 @@ case $out in *"E1: tracked in git, refusing to manage: creds"*) ok "post-checkou
 # --- usage ---------------------------------------------------------------
 out=$(lord --help); st=$?
 check "--help exits 0" test "$st" = 0
-case $out in "usage: lord [-n] [-e] [-i] [-V] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
+case $out in "usage: lord [-n] [dir]"*) ok "--help prints usage";; *) bad "--help output: $out";; esac
 out=$(lord -x 2>&1); st=$?
 check "unknown flag exits 22" test "$st" = 22
 out=$(lord -V); st=$?
@@ -380,7 +380,7 @@ mkdir -p "$R12/n/d" && printf 'tok\n' > "$R12/n/d/tok"
 printf '.env\nn/d/tok\n' > "$R12/.lord"
 (cd "$R12" && lord >/dev/null 2>&1)
 check "eject setup converged" test -L "$R12/.env"
-out=$(cd "$R12" && lord -e 2>&1); st=$?
+out=$(cd "$R12" && lord eject 2>&1); st=$?
 check "eject exits 0" test "$st" = 0
 check "eject prints restores, manifest last" test "$out" = "restore .env
 restore n/d/tok
@@ -391,11 +391,11 @@ check "eject removes store dir" test ! -d "$T/store/github.com/acme/ejectme"
 check "eject strips exclude block" sh -c "! grep -q lord-managed '$R12/.git/info/exclude'"
 check "eject removes stub hooks" test ! -e "$R12/.git/hooks/pre-commit" -a ! -e "$R12/.git/hooks/post-merge"
 check "ejected files visible to git" sh -c "git -C '$R12' status --porcelain | grep -q .env"
-out=$(cd "$R12" && lord -e 2>&1); st=$?
+out=$(cd "$R12" && lord eject 2>&1); st=$?
 check "second eject silent+0" test "$st" = 0 -a -z "$out"
 
 # eject preserves foreign hook content (repo5 has a husky-style pre-commit)
-(cd "$R5" && lord -e >/dev/null 2>&1)
+(cd "$R5" && lord eject >/dev/null 2>&1)
 check "eject keeps foreign hook lines" grep -q husky-stuff "$R5/.git/hooks/pre-commit"
 check "eject strips lord line from hook" sh -c "! grep -qxF lord '$R5/.git/hooks/pre-commit'"
 
@@ -428,9 +428,9 @@ check ".lord-id records provider id" grep -qx 'id github github.com 42' "$S/old/
 check ".lord-id not linked into worktree" test ! -e "$R13/.lord-id" -a ! -L "$R13/.lord-id"
 out=$(cd "$R13" && lord 2>&1); st=$?
 check "id second run silent+0" test "$st" = 0 -a -z "$out"
-out=$(cd "$R13" && lord -i 2>&1); st=$?
-check "-i exits 0" test "$st" = 0
-case $out in *"id    github github.com 42"*"recorded id github github.com 42"*) ok "-i prints live and recorded id";; *) bad "-i output: $out";; esac
+out=$(cd "$R13" && lord id 2>&1); st=$?
+check "id exits 0" test "$st" = 0
+case $out in *"id    github github.com 42"*"recorded id github github.com 42"*) ok "id prints live and recorded id";; *) bad "id output: $out";; esac
 
 # --- rename in place: set-url, then lord moves the store -----------------
 printf 'git@github.com:acme/new.git github github.com 42\n' >> "$IDS"
@@ -578,7 +578,7 @@ git -C "$R21" remote add origin git@github.com:acme/gone.git
 printf 'G=1\n' > "$R21/.env" && printf '.env\n' > "$R21/.lord"
 (cd "$R21" && lord >/dev/null 2>&1)
 check "record written before eject" test -f "$S/gone/.lord-id"
-out=$(cd "$R21" && lord -e 2>&1); st=$?
+out=$(cd "$R21" && lord eject 2>&1); st=$?
 check "eject with record exits 0" test "$st" = 0
 check "eject removes store and record" test ! -e "$S/gone"
 
@@ -619,20 +619,20 @@ check "path with a space registers" reg_has "$T/state" "$R31"
 # lstate <path>: the state -l reports for a checkout, read from the
 # tab separated form that a pipe gets
 lstate() {
-    lord -l 2>/dev/null | awk -F '\t' -v p="$1" '$3 == p { print $1 }'
+    lord list 2>/dev/null | awk -F '\t' -v p="$1" '$3 == p { print $1 }'
 }
 
 # -l: ok, then drift, then dead
-lord -l >/dev/null 2>&1; st=$?
-check "-l exits 0" test "$st" = 0
-check "-l shows an ok checkout" test "$(lstate "$R30")" = ok
-check "-l time field is ISO" sh -c "lord -l | awk -F '\t' -v p='$R30' '\$3 == p' | grep -Eq '^ok	[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z	'"
+lord list >/dev/null 2>&1; st=$?
+check "list exits 0" test "$st" = 0
+check "list shows an ok checkout" test "$(lstate "$R30")" = ok
+check "list time field is ISO" sh -c "lord list | awk -F '\t' -v p='$R30' '\$3 == p' | grep -Eq '^ok	[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z	'"
 rm -f "$R30/.env"; printf 'R=1\n' > "$R30/.env"   # identical copy: relink pending
-check "-l shows drift" test "$(lstate "$R30")" = drift
-check "-l changed nothing" test ! -L "$R30/.env"
+check "list shows drift" test "$(lstate "$R30")" = drift
+check "list changed nothing" test ! -L "$R30/.env"
 rm -rf "$R31"
-check "-l marks a deleted checkout dead" test "$(lstate "$R31")" = dead
-check "-l leaves a dead entry in place" reg_has "$T/state" "$R31"
+check "list marks a deleted checkout dead" test "$(lstate "$R31")" = dead
+check "list leaves a dead entry in place" reg_has "$T/state" "$R31"
 (cd "$R30" && lord >/dev/null 2>&1)
 
 # linked worktrees register apart from the main checkout
@@ -648,38 +648,74 @@ check "linked worktree registered apart" reg_has "$T/state" "$(git -C "$T/wt32" 
 
 # a warning alone is no drift
 printf 'stray\n' > "$T/store/github.com/acme/trees/stray.conf"
-check "-l counts a warning as ok" test "$(lstate "$R32")" = ok
+check "list counts a warning as ok" test "$(lstate "$R32")" = ok
 rm "$T/store/github.com/acme/trees/stray.conf"
 
 # on a terminal -l prints ages and aligned columns; script supplies the pty
 if command -v script >/dev/null 2>&1; then
     printf '2020-01-01T00:00:00Z %s\n' "$R32" >> "$T/state/checkouts"
-    tty_out=$(HOME="$T" script -qec "lord -l" /dev/null 2>&1 | tr -d '\r')
+    tty_out=$(HOME="$T" script -qec "lord list" /dev/null 2>&1 | tr -d '\r')
     case $tty_out in
-        *"ok     now  ~/repo30"*|*"drift  now  ~/repo30"*) ok "-l on a terminal shows a fresh age and ~";;
-        *) bad "-l terminal age: $tty_out";;
+        *"ok     now  ~/repo30"*|*"drift  now  ~/repo30"*) ok "list on a terminal shows a fresh age and ~";;
+        *) bad "list terminal age: $tty_out";;
     esac
-    case $tty_out in *"  "[0-9]"y "*" ~/repo32"*) ok "-l on a terminal shows years";; *) bad "-l terminal years: $tty_out";; esac
-    case $tty_out in *T[0-9][0-9]:*) bad "-l terminal leaks ISO: $tty_out";; *) ok "-l on a terminal hides the ISO time";; esac
-    case $tty_out in *"$T/repo"*) bad "-l terminal leaves HOME unabbreviated: $tty_out";; *) ok "-l on a terminal abbreviates HOME";; esac
+    case $tty_out in *"  "[0-9]"y "*" ~/repo32"*) ok "list on a terminal shows years";; *) bad "list terminal years: $tty_out";; esac
+    case $tty_out in *T[0-9][0-9]:*) bad "list terminal leaks ISO: $tty_out";; *) ok "list on a terminal hides the ISO time";; esac
+    case $tty_out in *"$T/repo"*) bad "list terminal leaves HOME unabbreviated: $tty_out";; *) ok "list on a terminal abbreviates HOME";; esac
     # registry order puts repo32 above repo30; a terminal sorts by path
-    check "-l on a terminal sorts by path" test "$(printf '%s\n' "$tty_out" | awk '/~\/repo30/ { a = NR } /~\/repo32/ && !b { b = NR } END { print (a < b) }')" = 1
-    check "-l in a pipe keeps registry order" test "$(lord -l | awk -F '\t' -v a="$R30" -v b="$R32" '$3 == a { x = NR } $3 == b && !y { y = NR } END { print (y < x) }')" = 1
+    check "list on a terminal sorts by path" test "$(printf '%s\n' "$tty_out" | awk '/~\/repo30/ { a = NR } /~\/repo32/ && !b { b = NR } END { print (a < b) }')" = 1
+    check "list in a pipe keeps registry order" test "$(lord list | awk -F '\t' -v a="$R30" -v b="$R32" '$3 == a { x = NR } $3 == b && !y { y = NR } END { print (y < x) }')" = 1
     (cd "$R32" && lord >/dev/null 2>&1)
 fi
 
 # eject deregisters
-(cd "$R30" && lord -e >/dev/null 2>&1)
+(cd "$R30" && lord eject >/dev/null 2>&1)
 check "eject deregisters" test -z "$(grep -F "$R30" "$T/state/checkouts")"
 
-# flag rules
-for args in "-a -l" "-a -e" "-l -i" "-a $R32"; do
-    # shellcheck disable=SC2086
-    out=$(lord $args 2>&1); st=$?
-    check "lord $args exits 22" test "$st" = 22
-done
+# grammar rules: each of these is refused with E22 and a message that says why
+refuse() { # refuse <desc> <message substring> <lord args...>
+    local d="$1" want="$2"
+    shift 2
+    out=$(lord "$@" 2>&1); st=$?
+    check "$d exits 22" test "$st" = 22
+    case $out in *"$want"*) ok "$d says why";; *) bad "$d message: $out";; esac
+}
+refuse "list with a dir" "takes no directory" list "$R32"
+refuse "all with a dir" "takes no directory" all "$R32"
+refuse "prune with a dir" "takes no directory" prune "$R32"
+refuse "list with -n" "takes no -n" list -n
+refuse "id with -n" "takes no -n" id -n
+refuse "command after its flag" "goes first" -n all
+refuse "old -a" "-a is now: lord all" -a
+refuse "old -e" "-e is now: lord eject" -e
+refuse "old -i" "-i is now: lord id" -i
+refuse "old -l" "-l is now: lord list" -l
+refuse "unknown word" "unknown command or directory: frob" frob
+refuse "two directories" "too many arguments" "$R32" "$R32"
 
-# -a on a registry of its own
+# a directory named like a command is reached with ./ or after --
+mkdir "$T/cmds"
+git init -q -b main "$T/cmds/list"
+git -C "$T/cmds/list" remote add origin git@github.com:acme/listed.git
+printf '.env\n' > "$T/cmds/list/.lord"
+out=$(cd "$T/cmds" && lord ./list 2>&1); st=$?
+check "./list names the directory" test "$st" = 0
+check "./list converged it" test -L "$T/cmds/list/.lord"
+out=$(cd "$T/cmds" && lord -n -- list 2>&1); st=$?
+check "-- ends the options" test "$st" = 0
+mkdir "$T/cmds/-n"
+git init -q -b main "$T/cmds/-n"
+git -C "$T/cmds/-n" remote add origin git@github.com:acme/dashn.git
+out=$(cd "$T/cmds" && lord -- -n 2>&1); st=$?
+check "-- lets a dir start with a dash" test "$st" = 0
+out=$(lord -h | head -1)
+check "-h prints usage" test "$out" = "usage: lord [-n] [dir]"
+out=$(lord list --help | head -1)
+check "--help works after a command" test "$out" = "usage: lord [-n] [dir]"
+out=$(lord list -h | head -1)
+check "-h works after a command" test "$out" = "usage: lord [-n] [dir]"
+
+# all and prune on a registry of their own
 S2="$T/state2"
 mkdir -p "$S2"
 R40="$T/repo40"
@@ -703,32 +739,45 @@ printf '2020-01-01T00:00:00Z %s\n' "$R42" >> "$S2/checkouts"
 printf 'later\n' > "$R40/later.txt"
 
 cp "$S2/checkouts" "$T/reg.before"
-out=$(LORD_STATE="$S2" lord -a -n 2>&1); st=$?
-check "-a -n exits with the failing checkout's code" test "$st" = 1
-case $out in *"$R40"*"adopt later.txt"*) ok "-a -n reports pending work";; *) bad "-a -n report: $out";; esac
-case $out in *"drop $R42"*) ok "-a -n reports the drop";; *) bad "-a -n drop: $out";; esac
-check "-a -n leaves the file real" test -f "$R40/later.txt" -a ! -L "$R40/later.txt"
-check "-a -n leaves the registry alone" cmp -s "$S2/checkouts" "$T/reg.before"
+out=$(LORD_STATE="$S2" lord all -n 2>&1); st=$?
+check "all -n exits with the failing checkout's code" test "$st" = 1
+case $out in *"$R40"*"adopt later.txt"*) ok "all -n reports pending work";; *) bad "all -n report: $out";; esac
+case $out in *"skip $R42"*) ok "all -n skips the non-lord path";; *) bad "all -n skip: $out";; esac
+check "all -n leaves the file real" test -f "$R40/later.txt" -a ! -L "$R40/later.txt"
+check "all -n leaves the registry alone" cmp -s "$S2/checkouts" "$T/reg.before"
 
-out=$(LORD_STATE="$S2" lord -a 2>&1); st=$?
-check "-a exits with the failing checkout's code" test "$st" = 1
-case $out in *"$R41"*"tracked in git"*) ok "-a reports the failure";; *) bad "-a failure: $out";; esac
-check "-a still converged the healthy checkout" test -L "$R40/later.txt"
-check "-a never initializes a non-lord repo" test ! -e "$R42/.lord" -a ! -d "$T/store/github.com/acme/all3"
-check "-a drops the non-lord path" test -z "$(grep -F "$R42" "$S2/checkouts")"
-check "-a keeps the live paths" reg_has "$S2" "$R40"
-check "-a keeps the failing path" reg_has "$S2" "$R41"
+out=$(LORD_STATE="$S2" lord all 2>&1); st=$?
+check "all exits with the failing checkout's code" test "$st" = 1
+case $out in *"$R41"*"tracked in git"*) ok "all reports the failure";; *) bad "all failure: $out";; esac
+check "all still converged the healthy checkout" test -L "$R40/later.txt"
+check "all never initializes a non-lord repo" test ! -e "$R42/.lord" -a ! -d "$T/store/github.com/acme/all3"
+case $out in *"skip $R42"*) ok "all skips the non-lord path";; *) bad "all skip: $out";; esac
+check "all leaves the registry alone" reg_has "$S2" "$R42"
+
+cp "$S2/checkouts" "$T/reg.before"
+out=$(LORD_STATE="$S2" lord prune -n 2>&1); st=$?
+check "prune -n exits 0" test "$st" = 0
+check "prune -n reports the drop" test "$out" = "drop $R42"
+check "prune -n leaves the registry alone" cmp -s "$S2/checkouts" "$T/reg.before"
+out=$(LORD_STATE="$S2" lord prune 2>&1); st=$?
+check "prune exits 0" test "$st" = 0
+check "prune reports the drop" test "$out" = "drop $R42"
+check "prune drops the non-lord path" test -z "$(grep -F "$R42" "$S2/checkouts")"
+check "prune keeps the live paths" reg_has "$S2" "$R40"
+check "prune keeps the failing path" reg_has "$S2" "$R41"
+out=$(LORD_STATE="$S2" lord prune 2>&1)
+check "prune with nothing to drop is silent" test -z "$out"
 
 # a registry holding only converged checkouts: -a is silent
 S3="$T/state3"
 (cd "$R40" && LORD_STATE="$S3" lord >/dev/null 2>&1)
-out=$(LORD_STATE="$S3" lord -a 2>&1); st=$?
-check "-a with nothing to do exits 0" test "$st" = 0
-check "-a with nothing to do is silent" test -z "$out"
-out=$(LORD_STATE="$T/state-none" lord -a 2>&1); st=$?
-check "-a without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
-out=$(LORD_STATE="$T/state-none" lord -l 2>&1); st=$?
-check "-l without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
+out=$(LORD_STATE="$S3" lord all 2>&1); st=$?
+check "all with nothing to do exits 0" test "$st" = 0
+check "all with nothing to do is silent" test -z "$out"
+out=$(LORD_STATE="$T/state-none" lord all 2>&1); st=$?
+check "all without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
+out=$(LORD_STATE="$T/state-none" lord list 2>&1); st=$?
+check "list without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
 
 printf '\n%d ok, %d failed\n' "$pass" "$failn"
 if [ "$failn" = 0 ]; then

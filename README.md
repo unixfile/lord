@@ -46,27 +46,43 @@ link and moving a renamed repo's store.
 
 One caveat: a repo that sets `core.hooksPath`, husky for example, never runs
 hooks from `.git/hooks`, so the guards are silent there. Run lord by hand in
-those repos, call it from the custom hooks or let `lord -a` cover them once
-they are registered.
+those repos, call it from the custom hooks or let `lord all` cover them
+once they are registered.
 
 ## Usage
 
 ```
-usage: lord [-n] [-e] [-i] [-V] [dir]
-       lord [-n] -a
-       lord -l
-
-  -n  dry run: report what a run would do, change nothing
-  -e  eject: move every managed file back into the worktree, remove the
-      exclude and hook blocks, and delete the repo's store dir if emptied
-  -i  identity: print the origin URL, store key, root commit and the
-      provider's repo id, looked up now; change nothing
-  -V  print version
-  -a  converge every checkout in the registry, see Checkouts
-  -l  list the registry: state, age or ISO time, path; see Checkouts
+usage: lord [-n] [dir]
+       lord all [-n]
+       lord list
+       lord prune [-n]
+       lord eject [-n] [dir]
+       lord id [dir]
+       lord -h | -V
 ```
 
+With no command lord converges one repo. The commands:
+
+- `all`: converge every checkout in the registry, see Checkouts
+- `list`: list the registry, see Checkouts
+- `prune`: drop registry paths that are no longer lord checkouts
+- `eject`: move every managed file back into the worktree, remove the
+  exclude and hook blocks, and delete the repo's store dir if emptied
+- `id`: print the origin URL, store key, root commit and the provider's
+  repo id, looked up now, and change nothing
+
+The options:
+
+- `-n`: dry run, report what a run would do and change nothing. It applies
+  to everything that writes, so not to `list` and `id`
+- `-h`: print usage
+- `-V`: print the version
+
+A command is the first word. To name a directory called `list`, write
+`./list`. `--` ends the options.
+
 dir defaults to the current directory and may be anywhere inside the repo.
+The commands that act on the registry take no dir.
 
 ```
 $ printf '.env\n' > .lord
@@ -133,7 +149,7 @@ at the old URL, told apart by its root commit, lord drops that forward and
 gives it a store of its own. A store moved by hand works too: links that
 point at a missing path in the store are re-pointed.
 
-`lord -i` prints the URL, key, root commit and the id as looked up now,
+`lord id` prints the URL, key, root commit and the id as looked up now,
 next to the recorded one.
 
 ### Providers
@@ -166,12 +182,12 @@ origin URL as `$1` and prints `<provider> <host> <id>`, or nothing.
 
 Every real run records its checkout in a registry, one line per work tree:
 the UTC time of the last run, then the path. A linked git worktree counts as
-its own checkout. `-n` and `-i` record nothing and `-e` removes the entry.
+its own checkout. `-n` and `id` record nothing and `eject` removes the entry.
 The registry lives in `$LORD_STATE`, never in the store, because paths
 belong to one machine.
 
 ```
-$ lord -l
+$ lord list
 drift  1d   ~/src/api
 ok     5m   ~/src/app
 dead   9w   ~/src/old
@@ -184,7 +200,7 @@ separated fields in registry order, newest first, with the UTC time in ISO
 form and the absolute path last.
 
 ```
-$ lord -l | cat
+$ lord list | cat
 ok	2026-10-13T14:11:55Z	/home/t/src/app
 ```
 
@@ -195,12 +211,15 @@ The state column reads:
 - `error`: a dry run fails, eg on a conflict
 - `dead`: the path is gone, or no longer a lord checkout
 
-`-l` only reads. `lord -a` runs lord in every live checkout and prints the
-path followed by the output of each one that had something to say. A failure
-in one checkout never stops the rest. The exit status is the first nonzero
-status of any checkout. Dead paths print as `drop <path>` and leave the
-registry. A path that holds a repo without a manifest counts as dead, so
-`-a` never initializes one. `-a -n` reports the same and changes nothing.
+`list` only reads. `lord all` runs lord in every live checkout and prints
+the path followed by the output of each one that had something to say. A
+failure in one checkout never stops the rest. The exit status is the first
+nonzero status of any checkout. A dead path prints as `skip <path>`. A path
+that holds a repo without a manifest counts as dead, so `all` never
+initializes one. `all -n` reports the same and changes nothing.
+
+`all` never edits the registry. `lord prune` drops the dead paths and prints
+a `drop <path>` line for each. `prune -n` only prints them.
 
 The registry is a convenience. If it cannot be written, the run goes on
 without it and prints nothing.
@@ -260,7 +279,7 @@ curl for id lookups.
 make check
 ```
 
-Runs the end-to-end suite: 240 checks across adoption, fresh clones,
+Runs the end-to-end suite: 275 checks across adoption, fresh clones,
 conflicts, hooks, eject, dry runs, renames, store moves and the registry. Id lookups run
 offline through `LORD_ID_CMD`.
 
