@@ -25,6 +25,8 @@ Running `lord` with no arguments converges the repo to that manifest:
   leaves a symlink behind
 - links store entries missing from the worktree, so a fresh clone gets its
   private files back
+- relinks a worktree copy identical to its store entry, eg a tool that
+  rewrote the file unchanged and replaced the symlink
 - restores files whose line was removed: each moves back into the worktree
   as a real file
 - regenerates a fenced block in `.git/info/exclude` so listed paths never
@@ -39,7 +41,8 @@ appears in the worktree as a symlink. A repo with no manifest anywhere gets
 one initialized, copied from `$LORD_CONFIG/skel` if that file exists.
 
 With nothing to do it prints nothing and exits 0. The only destructive
-operations are the adoption rename and moving a renamed repo's store.
+operations are the adoption rename, replacing an identical copy with its
+link and moving a renamed repo's store.
 
 One caveat: a repo that sets `core.hooksPath`, husky for example, never runs
 hooks from `.git/hooks`, so the guards are silent there. Run lord by hand in
@@ -165,10 +168,11 @@ adopted on the run after it appears.
 
 ## Conflicts
 
-lord never overwrites data. A path present in both worktree and store, a
-symlink pointing somewhere unexpected or a listed path tracked in git each
-produce an error naming the path, and the run exits nonzero. Orphaned store
-entries and unlisted symlinks into the store produce warnings only.
+lord never overwrites data. A path present in both worktree and store with
+different contents, a symlink pointing somewhere unexpected or a listed
+path tracked in git each produce an error naming the path, and the run
+exits nonzero. Orphaned store entries and unlisted symlinks into the store
+produce warnings only.
 
 Errors print as `E<code>: message` with errno-flavored codes:
 

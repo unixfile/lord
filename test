@@ -153,14 +153,32 @@ case $out in *"conflict: .env in both worktree and store: resolve manually"*) ok
 check "conflict leaves worktree file" grep -q SECRET=other "$R2/.env"
 check "conflict leaves store file" grep -q SECRET=1 "$STORE/.env"
 
-# identical copy also refuses, with hint
+# identical copy where the link was: relinked
 printf 'SECRET=1\n' > "$R2/.env"
+out=$(cd "$R2" && lord -n 2>&1); st=$?
+check "dry identical copy prints relink" test "$out" = "relink .env"
+check "dry identical copy left real" test -f "$R2/.env" -a ! -L "$R2/.env"
 out=$(cd "$R2" && lord 2>&1); st=$?
-check "identical conflict exits 17" test "$st" = 17
-case $out in *"(identical)"*) ok "identical hint";; *) bad "identical hint: $out";; esac
-rm "$R2/.env"
-out=$(cd "$R2" && lord 2>&1)
-check "conflict resolved by removing copy" test -L "$R2/.env"
+check "identical copy exits 0" test "$st" = 0
+check "identical copy prints relink" test "$out" = "relink .env"
+check "identical copy relinked" test "$(readlink "$R2/.env")" = "$STORE/.env"
+check "identical copy keeps store file" grep -q SECRET=1 "$STORE/.env"
+
+# identical manifest copy: relinked too
+cp "$STORE/.lord" "$T/manifest.copy"
+rm "$R2/.lord"; cp "$T/manifest.copy" "$R2/.lord"
+out=$(cd "$R2" && lord 2>&1); st=$?
+check "identical manifest exits 0" test "$st" = 0
+check "identical manifest prints relink" test "$out" = "relink .lord"
+check "identical manifest relinked" test "$(readlink "$R2/.lord")" = "$STORE/.lord"
+
+# differing manifest copy still refuses
+rm "$R2/.lord"; { cat "$T/manifest.copy"; printf '# local\n'; } > "$R2/.lord"
+out=$(cd "$R2" && lord 2>&1); st=$?
+check "differing manifest exits 17" test "$st" = 17
+check "differing manifest left real" test -f "$R2/.lord" -a ! -L "$R2/.lord"
+rm "$R2/.lord"; (cd "$R2" && lord >/dev/null 2>&1)
+check "manifest relinked after removing copy" test -L "$R2/.lord"
 
 # foreign symlink
 rm "$R2/.env"; ln -s /etc/hostname "$R2/.env"
@@ -186,6 +204,19 @@ printf '/abs/path\n../escape\n' >> "$R3/.lord"
 out=$(cd "$R3" && lord 2>&1); st=$?
 check "invalid entry exits 22" test "$st" = 22
 case $out in *"E22: invalid manifest entry: /abs/path"*) ok "invalid abs message";; *) bad "invalid: $out";; esac
+
+# tracked manifest identical to the store copy: refused, never relinked
+R3b="$T/repo3b"
+git init -q -b main "$R3b"
+git -C "$R3b" remote add origin git@github.com:acme/tracked.git
+mkdir -p "$T/store/github.com/acme/tracked"
+printf '.env\n' > "$T/store/github.com/acme/tracked/.lord"
+cp "$T/store/github.com/acme/tracked/.lord" "$R3b/.lord"
+git -C "$R3b" add .lord && git -C "$R3b" commit -qm c
+out=$(cd "$R3b" && lord 2>&1); st=$?
+check "tracked identical manifest exits 1" test "$st" = 1
+case $out in *"E1: tracked in git, refusing to manage: .lord"*) ok "tracked manifest message";; *) bad "tracked manifest message: $out";; esac
+check "tracked identical manifest left real" test -f "$R3b/.lord" -a ! -L "$R3b/.lord"
 
 # --- no-origin repo -----------------------------------------------------
 R4="$T/repo4"

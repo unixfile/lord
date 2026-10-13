@@ -30,7 +30,7 @@
 # shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -eu
 
-VERSION='1.1'
+VERSION='1.2'
 LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
 LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
 MARKER='# lord-managed'
@@ -489,14 +489,18 @@ converge_manifest() {
         error 21 "manifest is not a regular file: $w"
     fi
 
+    if [ -f "$w" ] && tracked "$MANIFEST"; then
+        error 1 "tracked in git, refusing to manage: $MANIFEST"
+    fi
     if [ -f "$w" ] && [ -f "$s" ]; then
-        if cmp -s "$w" "$s"; then
-            error 17 "conflict: $MANIFEST in both worktree and store (identical): remove one and rerun"
-        fi
-        error 17 "conflict: $MANIFEST in both worktree and store: resolve manually"
+        cmp -s "$w" "$s" \
+            || error 17 "conflict: $MANIFEST in both worktree and store: resolve manually"
+        # an identical copy where the link was, eg a tool rewrote it unchanged
+        relink "$MANIFEST"
+        mfile=$w
+        return 0
     fi
     if [ -f "$w" ]; then
-        tracked "$MANIFEST" && error 1 "tracked in git, refusing to manage: $MANIFEST"
         printf 'adopt %s\n' "$MANIFEST"
         mfile=$w
         if [ -z "$dry" ]; then
@@ -560,7 +564,8 @@ process_entry() {
 
     if [ -e "$w" ] && [ -e "$s" ]; then
         if [ -f "$w" ] && [ -f "$s" ] && cmp -s "$w" "$s"; then
-            fail 17 "conflict: $entry in both worktree and store (identical): remove one and rerun"
+            # an identical copy where the link was, eg a tool rewrote it unchanged
+            relink "$entry"
         else
             fail 17 "conflict: $entry in both worktree and store: resolve manually"
         fi
