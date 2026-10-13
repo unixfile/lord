@@ -14,15 +14,20 @@
 # URL is missing, lord finds the one that belongs to this repo by that id
 # and moves it, so a renamed or transferred repo keeps its files.
 # The only destructive operations are the adoption rename and that move.
+# Every real run records its checkout in a registry under the state dir, so
+# -l can list the checkouts on this machine and -a can converge all of them.
 # With nothing to do it prints nothing and exits 0.
 #
 # Environment:
 #   LORD_DIR         store root; default $XDG_DATA_HOME/lord
 #   LORD_CONFIG      config dir holding skel and hosts; default $XDG_CONFIG_HOME/lord
+#   LORD_STATE       state dir holding the checkout registry; default
+#                    $XDG_STATE_HOME/lord
 #   LORD_ID_CMD      command that prints "<provider> <host> <id>" for the URL
 #                    in $1, replacing the built-in API lookups
 #   XDG_DATA_HOME    default $HOME/.local/share
 #   XDG_CONFIG_HOME  default $HOME/.config
+#   XDG_STATE_HOME   default $HOME/.local/state
 #   GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN GITEA_TOKEN FORGEJO_TOKEN
 #   BITBUCKET_TOKEN AZURE_DEVOPS_PAT SRHT_TOKEN
 #                    API tokens for private repos, per provider
@@ -30,23 +35,29 @@
 # shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -eu
 
-VERSION='1.2'
+VERSION='1.3'
 LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
 LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
+LORD_STATE="${LORD_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/lord}"
 MARKER='# lord-managed'
 MANIFEST='.lord'
 META='.lord-id'
 
+self=$0
 rc=0
 dry=
 eject=
 ident=
+all=
+list=
 mfile=
 repo_id=
 
 usage() {
     cat <<'EOF'
 usage: lord [-n] [-e] [-i] [-V] [dir]
+       lord [-n] -a
+       lord -l
 
 Converge the git repo at dir (default: current directory) to its .lord
 manifest. .lord lists one literal path per line; each listed file lives in
@@ -63,11 +74,18 @@ With nothing to do it prints nothing and exits 0.
   -i  identity: print the origin URL, store key, root commit and the
       provider's repo id, looked up now; change nothing
   -V  print version
+  -a  converge every checkout in the registry, one block of output per
+      checkout that had something to report; a path that is no longer a
+      lord checkout is dropped from the registry; with -n, change nothing
+  -l  list the registry: ok, drift, error or dead, the time of the last
+      run and the path
 
 store:  $LORD_DIR, default $XDG_DATA_HOME/lord (~/.local/share/lord),
         keyed by the origin URL: <host>/<owner>/<repo>. A missing store is
         found again by the repo id, so renames and transfers carry over.
 config: $LORD_CONFIG, default $XDG_CONFIG_HOME/lord (~/.config/lord)
+state:  $LORD_STATE, default $XDG_STATE_HOME/lord (~/.local/state/lord),
+        holds the registry of checkouts on this machine
 EOF
 }
 
@@ -437,6 +455,86 @@ show_id() {
     exit 0
 }
 
+# Edit the registry of checkouts: "add <path>" puts the path first with the
+# current UTC time, "del <path>" removes it. One "<time> <path>" line per
+# checkout, newest first, the path last so it may hold spaces. The registry is
+# a convenience, so callers ignore failure and a run never depends on it.
+registry_edit() {
+    local f="$LORD_STATE/checkouts" tmp now=''
+    [ "$1" = add ] || [ -f "$f" ] || return 0
+    mkdir -p "$LORD_STATE" || return 1
+    tmp=$(mktemp "$LORD_STATE/checkouts.XXXXXX") || return 1
+    [ "$1" != add ] || now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    {
+        [ "$1" != add ] || printf '%s %s\n' "$now" "$2"
+        [ ! -f "$f" ] || P=$2 awk '{ l = $0; sub(/^[^ ]+ /, "") } $0 != ENVIRON["P"] { print l }' "$f"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+# live <path>: the root of a git work tree that lord manages. A path that was
+# deleted and recloned without lord fails, so -a never initializes a manifest
+# in a repo the user did not hand to lord.
+live() {
+    local p="$1" top url
+    [ -d "$p" ] || return 1
+    top=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [ "$top" = "$p" ] || return 1
+    if [ -e "$p/$MANIFEST" ] || [ -L "$p/$MANIFEST" ]; then
+        return 0
+    fi
+    url=$(git -C "$p" remote get-url origin 2>/dev/null) || return 1
+    [ -f "$LORD_DATA/$(urlkey "$url")/$MANIFEST" ]
+}
+
+# -l: one line per registered checkout. The state comes from a dry run in a
+# child process, which can fail without ending this one. Drift is anything
+# the dry run would do, and every action prints on stdout. Warnings go to
+# stderr and do not count.
+list_checkouts() {
+    local f="$LORD_STATE/checkouts" line t p st out state
+    [ -f "$f" ] || return 0
+    while IFS= read -r line; do
+        t=${line%% *} p=${line#* }
+        if live "$p"; then
+            st=0
+            out=$(sh "$self" -n "$p" 2>/dev/null </dev/null) || st=$?
+            if [ "$st" != 0 ]; then
+                state=error
+            elif [ -n "$out" ]; then
+                state=drift
+            else
+                state=ok
+            fi
+        else
+            state=dead
+        fi
+        printf '%-5s  %s  %s\n' "$state" "$t" "$p"
+    done < "$f"
+}
+
+# -a: run lord in every registered checkout. Each runs as a child, so one
+# failure never stops the rest, and the first nonzero status becomes ours.
+# A checkout with nothing to report stays silent. The loop reads the registry
+# as it was at the start, while the children rewrite it.
+converge_all() {
+    local f="$LORD_STATE/checkouts" line p st out
+    [ -f "$f" ] || return 0
+    while IFS= read -r line; do
+        p=${line#* }
+        if ! live "$p"; then
+            printf 'drop %s\n' "$p"
+            [ -n "$dry" ] || registry_edit del "$p" 2>/dev/null || :
+            continue
+        fi
+        st=0
+        # shellcheck disable=SC2086  # an empty ${dry:+-n} must vanish
+        out=$(sh "$self" ${dry:+-n} "$p" 2>&1 </dev/null) || st=$?
+        [ "$st" = 0 ] || [ "$rc" != 0 ] || rc=$st
+        [ -z "$out" ] || { printf '%s\n' "$p"; printf '%s\n' "$out" | sed 's/^/  /'; }
+    done < "$f"
+}
+
 # Parse the manifest at $1 into $entries and the exclude block $excl.
 read_entries() {
     local line
@@ -705,6 +803,7 @@ EOF
     fi
 
     if [ -z "$dry" ]; then
+        registry_edit del "$proj" 2>/dev/null || :
         rm -f "$store/$META"
         defence "$gitdir/info/exclude"
         remove_hook pre-commit
@@ -733,17 +832,27 @@ main() {
         --help)    usage; exit 0 ;;
         --version) printf 'lord %s\n' "$VERSION"; exit 0 ;;
     esac
-    while getopts :hneiV opt; do
+    while getopts :hneiVal opt; do
         case $opt in
             h) usage; exit 0 ;;
             n) dry=1 ;;
             e) eject=1 ;;
             i) ident=1 ;;
+            a) all=1 ;;
+            l) list=1 ;;
             V) printf 'lord %s\n' "$VERSION"; exit 0 ;;
             ?) error 22 "unknown flag: -$OPTARG" ;;
         esac
     done
     shift $((OPTIND - 1))
+
+    if [ -n "$all$list" ]; then
+        [ -z "$all" ] || [ -z "$list" ] || error 22 "-a and -l exclude each other"
+        [ -z "$eject$ident" ] || error 22 "-a and -l do not combine with -e or -i"
+        [ $# = 0 ] || error 22 "-a and -l take no directory"
+        if [ -n "$list" ]; then list_checkouts; else converge_all; fi
+        exit "$rc"
+    fi
 
     proj="${1:-$PWD}"
     proj=$(git -C "$proj" rev-parse --show-toplevel 2>/dev/null) \
@@ -761,6 +870,7 @@ hint: declare one now, it need not exist yet: git remote add origin git@github.c
     [ -z "$ident" ] || show_id
     relocate
     [ -z "$eject" ] || eject_repo
+    [ -n "$dry" ] || registry_edit add "$proj" 2>/dev/null || :
 
     converge_manifest
     read_entries "$mfile"

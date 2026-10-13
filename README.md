@@ -46,12 +46,15 @@ link and moving a renamed repo's store.
 
 One caveat: a repo that sets `core.hooksPath`, husky for example, never runs
 hooks from `.git/hooks`, so the guards are silent there. Run lord by hand in
-those repos or call it from the custom hooks.
+those repos, call it from the custom hooks or let `lord -a` cover them once
+they are registered.
 
 ## Usage
 
 ```
 usage: lord [-n] [-e] [-i] [-V] [dir]
+       lord [-n] -a
+       lord -l
 
   -n  dry run: report what a run would do, change nothing
   -e  eject: move every managed file back into the worktree, remove the
@@ -59,6 +62,8 @@ usage: lord [-n] [-e] [-i] [-V] [dir]
   -i  identity: print the origin URL, store key, root commit and the
       provider's repo id, looked up now; change nothing
   -V  print version
+  -a  converge every checkout in the registry, see Checkouts
+  -l  list the registry, see Checkouts
 ```
 
 dir defaults to the current directory and may be anywhere inside the repo.
@@ -79,10 +84,9 @@ origin URL as `<host>/<owner>/<repo>`. Both ssh and https remotes normalize
 to the same key, so reclones and remote rewrites find the same store. A repo
 needs an origin remote; it need not exist on the host yet.
 
-The store is plain files, so syncing it between machines is left to tools
-that already do that well. Put `~/.local/share/lord` in syncthing, a private
-git repo or an rsync job, and every checkout on every machine converges to
-the same private files.
+The store is plain files. lord is a tool for one machine: it keeps no
+machine identity in the store and never merges two copies of it. Back the
+store up with the tools you already use.
 
 A renamed repo keeps its store, see [Renames and transfers](#renames-and-transfers).
 
@@ -158,6 +162,38 @@ Without curl, or for an unknown host, there is no id and only the link rule
 applies. `LORD_ID_CMD` replaces the lookup entirely: a command that gets the
 origin URL as `$1` and prints `<provider> <host> <id>`, or nothing.
 
+## Checkouts
+
+Every real run records its checkout in a registry, one line per work tree:
+the UTC time of the last run, then the path. A linked git worktree counts as
+its own checkout. `-n` and `-i` record nothing and `-e` removes the entry.
+The registry lives in `$LORD_STATE`, never in the store, because paths
+belong to one machine.
+
+```
+$ lord -l
+ok     2026-10-13T14:11:55Z  /home/t/src/app
+drift  2026-10-12T09:30:02Z  /home/t/src/api
+dead   2026-09-30T17:45:10Z  /home/t/src/old
+```
+
+The state column reads:
+
+- `ok`: a dry run changes nothing, warnings aside
+- `drift`: a dry run would change something
+- `error`: a dry run fails, eg on a conflict
+- `dead`: the path is gone, or no longer a lord checkout
+
+`-l` only reads. `lord -a` runs lord in every live checkout and prints the
+path followed by the output of each one that had something to say. A failure
+in one checkout never stops the rest. The exit status is the first nonzero
+status of any checkout. Dead paths print as `drop <path>` and leave the
+registry. A path that holds a repo without a manifest counts as dead, so
+`-a` never initializes one. `-a -n` reports the same and changes nothing.
+
+The registry is a convenience. If it cannot be written, the run goes on
+without it and prints nothing.
+
 ## Manifest rules
 
 Paths are relative to the repo root and taken literally, no globs. Blank
@@ -190,10 +226,12 @@ Errors print as `E<code>: message` with errno-flavored codes:
 |----------|---------|
 | `LORD_DIR` | `$XDG_DATA_HOME/lord`, ie `~/.local/share/lord` |
 | `LORD_CONFIG` | `$XDG_CONFIG_HOME/lord`, ie `~/.config/lord` |
+| `LORD_STATE` | `$XDG_STATE_HOME/lord`, ie `~/.local/state/lord` |
 | `LORD_ID_CMD` | unset: the built-in provider lookups |
 
 `$LORD_CONFIG/skel` seeds the manifest for repos that have none.
 `$LORD_CONFIG/hosts` names the provider of self-hosted instances.
+`$LORD_STATE/checkouts` is the registry.
 
 ## Install
 
@@ -211,8 +249,8 @@ curl for id lookups.
 make check
 ```
 
-Runs the end-to-end suite: 181 checks across adoption, fresh clones,
-conflicts, hooks, eject, dry runs, renames and store moves. Id lookups run
+Runs the end-to-end suite: 233 checks across adoption, fresh clones,
+conflicts, hooks, eject, dry runs, renames, store moves and the registry. Id lookups run
 offline through `LORD_ID_CMD`.
 
 ## License

@@ -11,6 +11,7 @@ ln -s "$here/lord" "$T/bin/lord"
 export PATH="$T/bin:$PATH"
 export LORD_DIR="$T/store"
 export LORD_CONFIG="$T/config"
+export LORD_STATE="$T/state"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
 
@@ -580,6 +581,133 @@ check "record written before eject" test -f "$S/gone/.lord-id"
 out=$(cd "$R21" && lord -e 2>&1); st=$?
 check "eject with record exits 0" test "$st" = 0
 check "eject removes store and record" test ! -e "$S/gone"
+
+# --- registry, -l and -a -------------------------------------------------
+# reg_has <state dir> <path>: the registry lists the path
+reg_has() {
+    awk -v p="$2" '{ sub(/^[^ ]+ /, "") } $0 == p { f = 1 } END { exit !f }' "$1/checkouts"
+}
+
+# a real run registers, a dry run does not
+R30="$T/repo30"
+git init -q -b main "$R30"
+git -C "$R30" remote add origin git@github.com:acme/reg.git
+printf '.env\n' > "$R30/.lord"
+printf 'R=1\n' > "$R30/.env"
+(cd "$R30" && lord -n >/dev/null 2>&1)
+check "dry run does not register" test ! -f "$T/state/checkouts" -o -z "$(grep -F "$R30" "$T/state/checkouts")"
+(cd "$R30" && lord >/dev/null 2>&1)
+check "real run registers" reg_has "$T/state" "$R30"
+check "registry line is time then path" grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z $R30\$" "$T/state/checkouts"
+(cd "$R30" && lord >/dev/null 2>&1)
+check "rerun keeps one entry" test "$(grep -cF "$R30" "$T/state/checkouts")" = 1
+
+# a state dir that cannot be written never fails or clutters a run
+: > "$T/notadir"
+out=$(cd "$R30" && LORD_STATE="$T/notadir/x" lord 2>&1); st=$?
+check "unwritable state dir exits 0" test "$st" = 0
+check "unwritable state dir is silent" test -z "$out"
+
+# a path with a space survives the registry
+R31="$T/repo 31"
+git init -q -b main "$R31"
+git -C "$R31" remote add origin git@github.com:acme/spaced.git
+printf '.env\n' > "$R31/.lord"
+(cd "$R31" && lord >/dev/null 2>&1)
+check "path with a space registers" reg_has "$T/state" "$R31"
+
+# -l: ok, then drift, then dead
+out=$(lord -l 2>&1); st=$?
+check "-l exits 0" test "$st" = 0
+case $out in *"ok     "*"  $R30"*) ok "-l shows an ok checkout";; *) bad "-l ok: $out";; esac
+rm -f "$R30/.env"; printf 'R=1\n' > "$R30/.env"   # identical copy: relink pending
+out=$(lord -l 2>&1)
+case $out in *"drift  "*"  $R30"*) ok "-l shows drift";; *) bad "-l drift: $out";; esac
+check "-l changed nothing" test ! -L "$R30/.env"
+rm -rf "$R31"
+out=$(lord -l 2>&1)
+case $out in *"dead   "*"  $R31"*) ok "-l marks a deleted checkout dead";; *) bad "-l dead: $out";; esac
+check "-l leaves a dead entry in place" reg_has "$T/state" "$R31"
+(cd "$R30" && lord >/dev/null 2>&1)
+
+# linked worktrees register apart from the main checkout
+R32="$T/repo32"
+git init -q -b main "$R32"
+git -C "$R32" remote add origin git@github.com:acme/trees.git
+printf 'w\n' > "$R32/w" && git -C "$R32" add w && git -C "$R32" commit -qm w
+printf '.env\n' > "$R32/.lord"
+(cd "$R32" && lord >/dev/null 2>&1)
+git -C "$R32" worktree add -q "$T/wt32" -b b32 2>/dev/null
+check "main checkout registered" reg_has "$T/state" "$R32"
+check "linked worktree registered apart" reg_has "$T/state" "$(git -C "$T/wt32" rev-parse --show-toplevel)"
+
+# a warning alone is no drift
+printf 'stray\n' > "$T/store/github.com/acme/trees/stray.conf"
+out=$(lord -l 2>&1)
+case $out in *"ok     "*"  $R32"*) ok "-l counts a warning as ok";; *) bad "-l warning: $out";; esac
+rm "$T/store/github.com/acme/trees/stray.conf"
+
+# eject deregisters
+(cd "$R30" && lord -e >/dev/null 2>&1)
+check "eject deregisters" test -z "$(grep -F "$R30" "$T/state/checkouts")"
+
+# flag rules
+for args in "-a -l" "-a -e" "-l -i" "-a $R32"; do
+    # shellcheck disable=SC2086
+    out=$(lord $args 2>&1); st=$?
+    check "lord $args exits 22" test "$st" = 22
+done
+
+# -a on a registry of its own
+S2="$T/state2"
+mkdir -p "$S2"
+R40="$T/repo40"
+git init -q -b main "$R40"
+git -C "$R40" remote add origin git@github.com:acme/all1.git
+printf '.env\nlater.txt\n' > "$R40/.lord"
+printf 'A=1\n' > "$R40/.env"
+(cd "$R40" && LORD_STATE="$S2" lord >/dev/null 2>&1)
+R41="$T/repo41"
+git init -q -b main "$R41"
+git -C "$R41" remote add origin git@github.com:acme/all2.git
+printf 'x\n' > "$R41/config.ini"
+git -C "$R41" add config.ini && git -C "$R41" commit -qm c
+printf 'config.ini\n' > "$R41/.lord"
+(cd "$R41" && LORD_STATE="$S2" lord >/dev/null 2>&1)
+check "failing checkout still registers" reg_has "$S2" "$R41"
+R42="$T/repo42"
+git init -q -b main "$R42"
+git -C "$R42" remote add origin git@github.com:acme/all3.git
+printf '2020-01-01T00:00:00Z %s\n' "$R42" >> "$S2/checkouts"
+printf 'later\n' > "$R40/later.txt"
+
+cp "$S2/checkouts" "$T/reg.before"
+out=$(LORD_STATE="$S2" lord -a -n 2>&1); st=$?
+check "-a -n exits with the failing checkout's code" test "$st" = 1
+case $out in *"$R40"*"adopt later.txt"*) ok "-a -n reports pending work";; *) bad "-a -n report: $out";; esac
+case $out in *"drop $R42"*) ok "-a -n reports the drop";; *) bad "-a -n drop: $out";; esac
+check "-a -n leaves the file real" test -f "$R40/later.txt" -a ! -L "$R40/later.txt"
+check "-a -n leaves the registry alone" cmp -s "$S2/checkouts" "$T/reg.before"
+
+out=$(LORD_STATE="$S2" lord -a 2>&1); st=$?
+check "-a exits with the failing checkout's code" test "$st" = 1
+case $out in *"$R41"*"tracked in git"*) ok "-a reports the failure";; *) bad "-a failure: $out";; esac
+check "-a still converged the healthy checkout" test -L "$R40/later.txt"
+check "-a never initializes a non-lord repo" test ! -e "$R42/.lord" -a ! -d "$T/store/github.com/acme/all3"
+check "-a drops the non-lord path" test -z "$(grep -F "$R42" "$S2/checkouts")"
+check "-a keeps the live paths" reg_has "$S2" "$R40"
+check "-a keeps the failing path" reg_has "$S2" "$R41"
+
+# a registry holding only converged checkouts: -a is silent
+S3="$T/state3"
+(cd "$R40" && LORD_STATE="$S3" lord >/dev/null 2>&1)
+out=$(LORD_STATE="$S3" lord -a 2>&1); st=$?
+check "-a with nothing to do exits 0" test "$st" = 0
+check "-a with nothing to do is silent" test -z "$out"
+out=$(LORD_STATE="$T/state-none" lord -a 2>&1); st=$?
+check "-a without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
+out=$(LORD_STATE="$T/state-none" lord -l 2>&1); st=$?
+check "-l without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
 
 printf '\n%d ok, %d failed\n' "$pass" "$failn"
 if [ "$failn" = 0 ]; then
