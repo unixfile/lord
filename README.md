@@ -31,9 +31,11 @@ Running `lord` with no arguments converges the repo to that manifest:
   as a real file
 - regenerates a fenced block in `.git/info/exclude` so listed paths never
   appear in git status, leaving `.gitignore` alone
-- installs pre-commit, post-checkout and post-merge hooks that rerun lord,
-  so a staged secret blocks the commit and a checkout that materializes a
-  listed file is surfaced immediately
+- installs pre-commit, post-checkout, post-merge and post-rewrite hooks
+  that rerun lord, so a staged secret blocks the commit and a checkout that
+  materializes a listed file is surfaced immediately
+- links a private stash into the git dir and keeps the repo's git notes
+  there, see [Stash and notes](#stash-and-notes)
 - refuses on conflicts instead of guessing
 
 The manifest itself is managed the same way: it lives in the store and
@@ -66,8 +68,8 @@ With no command lord converges one repo. The commands:
 - `all`: converge every checkout in the registry, see Checkouts
 - `list`: list the registry, see Checkouts
 - `prune`: drop registry paths that are no longer lord checkouts
-- `eject`: move every managed file back into the worktree, remove the
-  exclude and hook blocks, and delete the repo's store dir if emptied
+- `eject`: move every managed file and the stash back, remove the exclude
+  and hook blocks, and delete the repo's store dir if emptied
 - `id`: print the origin URL, store key, root commit and the provider's
   repo id, looked up now, and change nothing
 
@@ -105,6 +107,43 @@ machine identity in the store and never merges two copies of it. Back the
 store up with the tools you already use.
 
 A renamed repo keeps its store, see [Renames and transfers](#renames-and-transfers).
+
+## Stash and notes
+
+`.git/lord` is a private directory for the repo, kept in the store as
+`.lord-stash` and linked into the git dir. Git neither tracks nor pushes
+anything there, and it outlives the checkout like any listed file. In a
+linked worktree it sits in the common git dir. A real directory found at
+`.git/lord` is adopted.
+
+lord keeps the repo's git notes in the stash as `notes.bundle`, every ref
+under `refs/notes/`. Each run compares them ref by ref:
+
+- a ref only here, or ahead here, is saved to the bundle
+- a ref only in the bundle, or ahead there, is loaded by a fast-forward, so
+  a fresh clone gets its notes back on the first run
+- a ref that diverged is a conflict, E17, and the bundle stays as it is.
+  Fetch the bundle's ref and merge it with `git notes merge`
+- a ref deleted here comes back from the bundle, since lord never drops
+  notes. Delete it from the bundle too to drop it for good
+
+```
+$ git notes add -m 'reviewed'
+$ lord
+save refs/notes/commits
+```
+
+A pre-push hook refuses every ref under `refs/notes/`, so a mirror push or a
+copied push refspec cannot publish them. `git push --no-verify` skips it.
+The hook reads the refs on stdin, so in a pre-push hook whose own code reads
+them first the guard sees nothing.
+
+A repo that sets `core.hooksPath` never runs the guard, so lord leaves its
+notes alone in both directions and warns when there are any.
+
+Notes are keyed by commit, and an amend or rebase makes new commits. Set
+`git config --global notes.rewriteRef refs/notes/commits` and git moves each
+note to the new commit; the post-rewrite hook then saves the result.
 
 ## Renames and transfers
 
@@ -246,9 +285,9 @@ Errors print as `E<code>: message` with errno-flavored codes:
 |------|---------|
 | 1    | listed path is tracked in git |
 | 2    | no origin remote, or store file missing |
-| 17   | worktree and store conflict, or several stores with this repo's id |
+| 17   | worktree and store conflict, notes that diverged from the stash, or several stores with this repo's id |
 | 21   | manifest is not a regular file |
-| 22   | invalid flag, manifest entry or directory, or a manifest listing `.lord-id` |
+| 22   | invalid flag, manifest entry or directory, or a manifest listing `.lord-id` or `.lord-stash` |
 
 ## Environment
 
@@ -279,9 +318,9 @@ curl for id lookups.
 make check
 ```
 
-Runs the end-to-end suite: 275 checks across adoption, fresh clones,
-conflicts, hooks, eject, dry runs, renames, store moves and the registry. Id lookups run
-offline through `LORD_ID_CMD`.
+Runs the end-to-end suite: 317 checks across adoption, fresh clones,
+conflicts, hooks, eject, dry runs, renames, store moves, the registry, the
+stash and notes. Id lookups run offline through `LORD_ID_CMD`.
 
 ## License
 

@@ -13,6 +13,11 @@
 # commit and the hosting provider's repo id. When the store for the origin
 # URL is missing, lord finds the one that belongs to this repo by that id
 # and moves it, so a renamed or transferred repo keeps its files.
+# Each store also holds .lord-stash, a private directory linked into the git
+# dir as lord. Git neither tracks nor pushes it. lord keeps the repo's git
+# notes there as a bundle: a run saves notes that are newer here and loads
+# notes that are newer in the stash, so a fresh clone gets them back, and a
+# pre-push hook refuses to push them.
 # The only destructive operations are the adoption rename and that move.
 # Every real run records its checkout in a registry under the state dir, so
 # lord list can show the checkouts on this machine and lord all can converge
@@ -36,13 +41,16 @@
 # shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -eu
 
-VERSION='2.0'
+VERSION='2.1'
 LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
 LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
 LORD_STATE="${LORD_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/lord}"
 MARKER='# lord-managed'
 MANIFEST='.lord'
 META='.lord-id'
+STASH='.lord-stash'
+GITSTASH='lord'
+NOTES='notes.bundle'
 
 self=$0
 rc=0
@@ -69,6 +77,8 @@ listed files into the store, links store entries into fresh clones, moves
 files back when their line is removed, keeps .git/info/exclude and hooks
 in sync, and refuses on conflicts. A repo without a manifest gets one
 initialized and linked, seeded from $LORD_CONFIG/skel if that file exists.
+.git/lord is a private stash in the store, never tracked or pushed. lord
+keeps the repo's git notes there and refuses to push them.
 With nothing to do it prints nothing and exits 0.
 
 commands:
@@ -80,8 +90,8 @@ commands:
          time is an age and $HOME shows as ~, otherwise the rows keep
          registry order and the fields are tab separated, the time in ISO
   prune  drop the registry paths that are no longer lord checkouts
-  eject  move every managed file back into the worktree, remove the
-         exclude and hook blocks, and delete the repo's store dir if emptied
+  eject  move every managed file and the stash back, remove the exclude
+         and hook blocks, and delete the repo's store dir if emptied
   id     print the origin URL, store key, root commit and the provider's
          repo id, looked up now; change nothing
 
@@ -141,15 +151,32 @@ defence() {
     rm -f "$tmp"
 }
 
+# install_hook <name> [body]: the fenced block in hook <name> runs body,
+# lord by default.
 install_hook() {
-    local dst="$gitdir/hooks/$1"
+    local dst="$gitdir/hooks/$1" body="${2:-lord}"
     mkdir -p "$gitdir/hooks"
     if [ ! -f "$dst" ]; then
         printf '#!/bin/sh\n' > "$dst"
         chmod +x "$dst"
     fi
-    printf 'lord\n' | fence "$dst"
+    printf '%s\n' "$body" | fence "$dst"
 }
+
+# The pre-push block refuses every notes ref, since lord keeps notes in the
+# stash. It reads the refs on stdin, so in a pre-push hook whose own code
+# reads them first it sees nothing. git push --no-verify skips it.
+prepush_block() {
+    cat <<'EOF'
+while read -r _ _ ref _; do
+    case $ref in refs/notes/*)
+        printf 'E1: refusing to push %s: lord keeps notes private\n' "$ref" >&2
+        exit 1 ;;
+    esac
+done
+EOF
+}
+
 
 remove_hook() {
     local dst="$gitdir/hooks/$1"
@@ -628,7 +655,7 @@ read_entries() {
         line=${line%/}
         case $line in "$MANIFEST") continue ;; esac
         case $line in
-            "$META")
+            "$META"|"$STASH")
                 fail 22 "reserved for lord's own metadata: $line"
                 continue ;;
         esac
@@ -784,7 +811,7 @@ sweep_store() {
     for path in "$store/$dir".[!.]* "$store/$dir"*; do
         { [ -e "$path" ] || [ -L "$path" ]; } || continue
         rel=${path#"$store/"}
-        case $rel in "$MANIFEST"|"$META"|"$META.tmp") continue ;; esac
+        case $rel in "$MANIFEST"|"$META"|"$META.tmp"|"$STASH") continue ;; esac
         covered=none
         while IFS= read -r entry; do
             [ -n "$entry" ] || continue
@@ -843,10 +870,142 @@ EOF
     done
 }
 
+# stash_name: the stash as runs print it, relative to the work tree when the
+# git dir lies inside it.
+stash_name() {
+    case $gitdir in
+        "$proj"/*) printf '%s\n' "${gitdir#"$proj/"}/$GITSTASH" ;;
+        *)         printf '%s\n' "$gitdir/$GITSTASH" ;;
+    esac
+}
+
+# Converge the stash: $gitdir/lord is a link to the store's .lord-stash,
+# which lord creates when missing. A real directory there is adopted, as a
+# listed file would be.
+converge_stash() {
+    local w="$gitdir/$GITSTASH" s="$store/$STASH" name target
+    name=$(stash_name)
+
+    if [ -L "$w" ]; then
+        target=$(readlink "$w")
+        if [ "$target" = "$s" ]; then
+            [ ! -d "$s" ] || return 0
+            printf 'init %s\n' "$name"
+            [ -n "$dry" ] || mkdir -p "$s"
+        elif stale "$target" "$s"; then
+            printf 'relink %s\n' "$name"
+            [ -n "$dry" ] || { rm "$w"; ln -s "$s" "$w"; }
+        else
+            fail 17 "conflict: $name is a symlink to $target, expected $s"
+        fi
+        return 0
+    fi
+    if [ -e "$w" ] && [ ! -d "$w" ]; then
+        fail 17 "conflict: $name is not a directory"
+        return 0
+    fi
+    if [ -d "$w" ] && [ -e "$s" ]; then
+        fail 17 "conflict: $name in both git dir and store: resolve manually"
+        return 0
+    fi
+    if [ -d "$w" ]; then
+        printf 'adopt %s\n' "$name"
+        [ -n "$dry" ] || { mkdir -p "$store"; mv "$w" "$s"; ln -s "$s" "$w"; }
+        return 0
+    fi
+    if [ -d "$s" ]; then
+        printf 'link %s\n' "$name"
+    else
+        printf 'init %s\n' "$name"
+    fi
+    [ -n "$dry" ] || { mkdir -p "$s"; ln -s "$s" "$w"; }
+}
+
+# Sync the notes refs with the bundle in the stash, ref by ref. A ref only
+# here, or ahead here, is saved; a ref only in the stash, or ahead there, is
+# loaded by a fast-forward. Refs that diverged are a conflict and leave the
+# bundle as it is. A ref deleted here comes back from the stash, so lord
+# never drops notes. A dry run that lacks the stash's objects reports a
+# load, since it may not fetch them to tell. A repo that sets core.hooksPath
+# never runs the pre-push guard, so lord leaves its notes alone both ways
+# and says so when there are any.
+sync_notes() {
+    local b="$store/$STASH/$NOTES" heads='' here there ref save='' torn='' got='' tmp
+
+    if [ -n "$(git -C "$proj" config core.hooksPath 2>/dev/null)" ]; then
+        if [ -f "$b" ] || [ -n "$(git -C "$proj" for-each-ref refs/notes/)" ]; then
+            warn "core.hooksPath is set, so the push guard never runs: notes left alone"
+        fi
+        return 0
+    fi
+
+    if [ -f "$b" ]; then
+        heads=$(git -C "$proj" bundle list-heads "$b" 2>/dev/null) || {
+            fail 17 "unreadable notes bundle: $b"
+            return 0
+        }
+    fi
+    for ref in $( { printf '%s\n' "$heads"; git -C "$proj" for-each-ref --format='%(objectname) %(refname)' refs/notes/; } \
+        | awk 'NF == 2 { print $2 }' | LC_ALL=C sort -u); do
+        case $ref in refs/notes/*) ;; *) continue ;; esac
+        here=$(git -C "$proj" rev-parse -q --verify "$ref^{commit}" 2>/dev/null) || here=
+        there=$(printf '%s\n' "$heads" | awk -v r="$ref" '$2 == r { print $1; exit }')
+        [ "$here" != "$there" ] || continue
+        if [ -z "$there" ]; then
+            printf 'save %s\n' "$ref"
+            save=1
+            continue
+        fi
+        if [ -z "$got" ] && ! git -C "$proj" cat-file -e "$there^{commit}" 2>/dev/null; then
+            if [ -n "$dry" ]; then
+                printf 'load %s\n' "$ref"
+                continue
+            fi
+            git -C "$proj" bundle unbundle "$b" >/dev/null 2>&1 || {
+                fail 17 "unreadable notes bundle: $b"
+                return 0
+            }
+            got=1
+        fi
+        if [ -z "$here" ] || git -C "$proj" merge-base --is-ancestor "$here" "$there" 2>/dev/null; then
+            printf 'load %s\n' "$ref"
+            [ -n "$dry" ] || git -C "$proj" update-ref "$ref" "$there" "$here"
+        elif git -C "$proj" merge-base --is-ancestor "$there" "$here" 2>/dev/null; then
+            printf 'save %s\n' "$ref"
+            save=1
+        else
+            fail 17 "conflict: $ref differs here and in the stash: merge with git notes --ref=$ref merge, after fetching it from $b"
+            torn=1
+        fi
+    done
+    [ -n "$save" ] && [ -z "$torn" ] && [ -z "$dry" ] || return 0
+    tmp="$b.tmp"
+    # shellcheck disable=SC2046  # one argument per ref
+    if git -C "$proj" bundle create -q "$tmp" $(git -C "$proj" for-each-ref --format='%(refname)' refs/notes/) 2>/dev/null; then
+        mv "$tmp" "$b"
+    else
+        rm -f "$tmp"
+        fail 17 "cannot write the notes bundle: $b"
+    fi
+}
+
 # Undo lord management: move every managed file back into the worktree,
 # manifest last, then strip the fenced blocks and prune the emptied store.
 eject_repo() {
     local entry w s
+
+    # the stash goes back into the git dir as a real directory
+    if [ -d "$store/$STASH" ]; then
+        if [ -L "$gitdir/$GITSTASH" ] && [ "$(readlink "$gitdir/$GITSTASH")" = "$store/$STASH" ]; then
+            printf 'restore %s\n' "$(stash_name)"
+            [ -n "$dry" ] || { rm "$gitdir/$GITSTASH"; mv "$store/$STASH" "$gitdir/$GITSTASH"; }
+        elif [ ! -e "$gitdir/$GITSTASH" ] && [ ! -L "$gitdir/$GITSTASH" ]; then
+            printf 'restore %s\n' "$(stash_name)"
+            [ -n "$dry" ] || mv "$store/$STASH" "$gitdir/$GITSTASH"
+        else
+            fail 17 "conflict: $(stash_name) in both git dir and store: resolve manually"
+        fi
+    fi
 
     if [ -L "$proj/$MANIFEST" ]; then
         [ "$(readlink "$proj/$MANIFEST")" = "$store/$MANIFEST" ] \
@@ -890,6 +1049,8 @@ EOF
         remove_hook pre-commit
         remove_hook post-checkout
         remove_hook post-merge
+        remove_hook post-rewrite
+        remove_hook pre-push
         if [ -d "$store" ]; then
             find "$store" -depth -type d -exec rmdir {} + 2>/dev/null || true
         fi
@@ -992,12 +1153,19 @@ hint: declare one now, it need not exist yet: git remote add origin git@github.c
 $entries
 EOF
 
+    converge_stash
+    sync_notes
+
     # pre-commit blocks listed paths from being committed; checkout and merge
-    # can materialize a listed file from history, worth surfacing immediately
+    # can materialize a listed file from history, worth surfacing immediately;
+    # post-rewrite saves notes an amend or rebase moved; pre-push keeps notes
+    # off every remote
     if [ -z "$dry" ]; then
         install_hook pre-commit
         install_hook post-checkout
         install_hook post-merge
+        install_hook post-rewrite
+        install_hook pre-push "$(prepush_block)"
     fi
 
     sweep_store ''

@@ -233,7 +233,8 @@ git init -q -b main "$R8"
 git -C "$R8" remote add origin git@github.com:acme/blank.git
 out=$(cd "$R8" && lord 2>&1); st=$?
 check "bootstrap exits 0" test "$st" = 0
-check "bootstrap prints init" test "$out" = "init .lord"
+check "bootstrap prints init" test "$out" = "init .lord
+init .git/lord"
 check "bootstrap .lord is symlink" test -L "$R8/.lord"
 check "bootstrap manifest in store" test -f "$T/store/github.com/acme/blank/.lord"
 check "bootstrap exclude has /.lord" grep -qxF '/.lord' "$R8/.git/info/exclude"
@@ -333,7 +334,8 @@ git init -q -b main "$R9"
 git -C "$R9" remote add origin git@github.com:acme/skel.git
 out=$(cd "$R9" && lord 2>&1); st=$?
 check "skel bootstrap exits 0" test "$st" = 0
-check "skel bootstrap prints source" test "$out" = "init .lord (from skel)"
+check "skel bootstrap prints source" test "$out" = "init .lord (from skel)
+init .git/lord"
 check "manifest copied from skel" cmp -s "$T/config/skel" "$T/store/github.com/acme/skel/.lord"
 check "skel entry excluded before existing" grep -qxF '/.env' "$R9/.git/info/exclude"
 check "nonexistent skel entry not linked" test ! -e "$R9/.env" -a ! -L "$R9/.env"
@@ -352,7 +354,8 @@ printf '.env\n' > "$R10/.lord"
 out=$(cd "$R10" && lord -n 2>&1); st=$?
 check "dry run exits 0" test "$st" = 0
 check "dry prints plan" test "$out" = "adopt .lord
-adopt .env"
+adopt .env
+init .git/lord"
 check "dry leaves manifest real" test -f "$R10/.lord" -a ! -L "$R10/.lord"
 check "dry leaves file real" test -f "$R10/.env" -a ! -L "$R10/.env"
 check "dry creates no store" test ! -d "$T/store/github.com/acme/dry"
@@ -368,7 +371,8 @@ git -C "$R11" remote add origin git@github.com:acme/dryinit.git
 printf 'S=1\n' > "$R11/.env"
 out=$(cd "$R11" && lord -n 2>&1)
 check "dry init plans skel adoption" test "$out" = "init .lord (from skel)
-adopt .env"
+adopt .env
+init .git/lord"
 check "dry init creates nothing" test ! -e "$R11/.lord" -a ! -d "$T/store/github.com/acme/dryinit"
 
 # --- eject ----------------------------------------------------------------
@@ -382,7 +386,8 @@ printf '.env\nn/d/tok\n' > "$R12/.lord"
 check "eject setup converged" test -L "$R12/.env"
 out=$(cd "$R12" && lord eject 2>&1); st=$?
 check "eject exits 0" test "$st" = 0
-check "eject prints restores, manifest last" test "$out" = "restore .env
+check "eject prints restores, manifest last" test "$out" = "restore .git/lord
+restore .env
 restore n/d/tok
 restore .lord"
 check "ejected files real" test -f "$R12/.env" -a ! -L "$R12/.env" -a -f "$R12/n/d/tok" -a ! -L "$R12/n/d/tok"
@@ -443,7 +448,8 @@ out=$(cd "$R13" && lord 2>&1); st=$?
 check "rename exits 0" test "$st" = 0
 check "rename prints move and relinks" test "$out" = "move github.com/acme/old -> github.com/acme/new
 relink .lord
-relink .env"
+relink .env
+relink .git/lord"
 check "store moved to new key" test -f "$S/new/.env" -a ! -L "$S/new"
 check "old key forwards to new" test "$(readlink "$S/old")" = "$S/new"
 check "links point at new key" test "$(readlink "$R13/.env")" = "$S/new/.env"
@@ -460,7 +466,8 @@ git -C "$R14" remote set-url origin git@github.com:acme/old.git
 out=$(cd "$R14" && lord 2>&1); st=$?
 check "old-URL clone exits 0" test "$st" = 0
 check "old-URL clone links, never moves" test "$out" = "link .lord
-link .env"
+link .env
+link .git/lord"
 check "old-URL clone reads the file" grep -q S=1 "$R14/.env"
 check "store stays at new key" test -d "$S/new" -a ! -L "$S/new" -a -L "$S/old"
 check "old-URL clone leaves the record alone" grep -qx 'url git@github.com:acme/new.git' "$S/new/.lord-id"
@@ -476,7 +483,8 @@ out=$(cd "$R15" && lord 2>&1); st=$?
 check "fresh clone after rename exits 0" test "$st" = 0
 check "fresh clone moves by id and links" test "$out" = "move github.com/acme/new -> github.com/acme/newer
 link .lord
-link .env"
+link .env
+link .git/lord"
 check "fresh clone reads the file" grep -q S=1 "$R15/.env"
 out=$(cd "$R13" && lord 2>&1); st=$?
 check "earlier clone follows the chain" test "$st" = 0 -a -z "$out"
@@ -510,7 +518,8 @@ out=$(cd "$R17" && lord 2>&1); st=$?
 check "offline rename exits 0" test "$st" = 0
 check "offline rename moves by link" test "$out" = "move gitea.example/me/off -> gitea.example/me/on
 relink .lord
-relink .env"
+relink .env
+relink .git/lord"
 check "offline rename reads the file" grep -q T=1 "$R17/.env"
 # a fresh clone with no id and no link has nothing to go on
 R18="$T/repo18"
@@ -548,7 +557,8 @@ git -C "$R17" remote set-url origin git@gitea.example:me/hand.git
 out=$(cd "$R17" && lord 2>&1); st=$?
 check "manual move exits 0" test "$st" = 0
 check "manual move relinks" test "$out" = "relink .lord
-relink .env"
+relink .env
+relink .git/lord"
 check "manual move reads the file" grep -q T=1 "$R17/.env"
 
 # --- a new repo under a forwarded name gets its own store ----------------
@@ -778,6 +788,111 @@ out=$(LORD_STATE="$T/state-none" lord all 2>&1); st=$?
 check "all without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
 out=$(LORD_STATE="$T/state-none" lord list 2>&1); st=$?
 check "list without a registry exits 0 silent" test "$st" = 0 -a -z "$out"
+
+# --- stash and notes ----------------------------------------------------
+NS="$T/store/github.com/acme/notes"
+N1="$T/notes1"
+git init -q -b main "$N1"
+git -C "$N1" remote add origin git@github.com:acme/notes.git
+printf 'a\n' > "$N1/a" && git -C "$N1" add a && git -C "$N1" commit -qm one
+mkdir -p "$N1/.git/lord" && printf 'mine\n' > "$N1/.git/lord/keep"
+out=$(cd "$N1" && lord 2>&1); st=$?
+check "stash run exits 0" test "$st" = 0
+check "a real stash is adopted" test "$out" = "init .lord (from skel)
+adopt .git/lord"
+check "stash is a link into the store" test "$(readlink "$N1/.git/lord")" = "$NS/.lord-stash"
+check "adopted stash keeps its files" grep -qx mine "$NS/.lord-stash/keep"
+check "pre-push guard installed" grep -qF 'refs/notes/*)' "$N1/.git/hooks/pre-push"
+check "post-rewrite hook installed" grep -qxF 'lord' "$N1/.git/hooks/post-rewrite"
+check "status clean with a stash" test -z "$(git -C "$N1" status --porcelain)"
+
+printf '.lord-stash\n' >> "$N1/.lord"
+out=$(cd "$N1" && lord 2>&1); st=$?
+check "manifest listing the stash exits 22" test "$st" = 22
+case $out in *"reserved for lord's own metadata: .lord-stash"*) ok "stash entry refused";; *) bad "stash entry: $out";; esac
+sed -i.bak '/^\.lord-stash$/d' "$NS/.lord" && rm -f "$NS/.lord.bak"
+
+git -C "$N1" notes add -m 'first note'
+out=$(cd "$N1" && lord -n 2>&1)
+check "dry run plans the save" test "$out" = "save refs/notes/commits"
+check "dry run writes no bundle" test ! -e "$NS/.lord-stash/notes.bundle"
+out=$(cd "$N1" && lord 2>&1); st=$?
+check "notes save exits 0" test "$st" = 0
+check "notes save prints the ref" test "$out" = "save refs/notes/commits"
+check "bundle holds the ref" test "$(git -C "$N1" bundle list-heads "$NS/.lord-stash/notes.bundle" | cut -d' ' -f2)" = refs/notes/commits
+out=$(cd "$N1" && lord 2>&1)
+check "saved notes run silent" test -z "$out"
+
+N2="$T/notes2"
+git clone -q "$N1" "$N2"
+git -C "$N2" remote set-url origin git@github.com:acme/notes.git
+out=$(cd "$N2" && lord 2>&1); st=$?
+check "clone with notes exits 0" test "$st" = 0
+check "clone links the stash and loads notes" test "$out" = "link .lord
+link .git/lord
+load refs/notes/commits"
+check "clone reads the note" test "$(git -C "$N2" notes show HEAD 2>/dev/null)" = "first note"
+
+BARE="$T/notes-bare.git"
+git init -q --bare "$BARE"
+if git -C "$N2" push -q "$BARE" refs/notes/commits 2>"$T/push.err"; then
+    bad "pre-push refuses notes"
+else
+    ok "pre-push refuses notes"
+fi
+check "pre-push names the ref" grep -q '^E1: refusing to push refs/notes/commits' "$T/push.err"
+check "refused notes never reach the remote" test -z "$(git -C "$BARE" for-each-ref refs/notes/)"
+check "pre-push lets branches through" git -C "$N2" push -q "$BARE" main
+
+git -C "$N2" notes add -f -m 'second note'
+out=$(cd "$N2" && lord 2>&1)
+check "newer notes here are saved" test "$out" = "save refs/notes/commits"
+out=$(cd "$N1" && lord 2>&1)
+check "newer notes in the stash are loaded" test "$out" = "load refs/notes/commits"
+check "load fast-forwards the ref" test "$(git -C "$N1" notes show HEAD)" = "second note"
+
+git -C "$N1" update-ref -d refs/notes/commits
+out=$(cd "$N1" && lord 2>&1)
+check "a deleted notes ref comes back" test "$out" = "load refs/notes/commits"
+
+printf 'b\n' > "$N1/b" && git -C "$N1" add b && git -C "$N1" commit -qm two >/dev/null 2>&1
+git -C "$N1" notes add -m 'note on two'
+git -C "$N2" notes add -f -m 'other note'
+(cd "$N1" && lord >/dev/null 2>&1)
+cp "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
+out=$(cd "$N2" && lord 2>&1); st=$?
+check "diverged notes exit 17" test "$st" = 17
+case $out in *"conflict: refs/notes/commits differs here and in the stash"*) ok "diverged notes named";; *) bad "diverged: $out";; esac
+check "diverged notes leave the bundle" cmp -s "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
+git -C "$N2" update-ref -d refs/notes/commits
+out=$(cd "$N2" && lord 2>&1)
+check "dropping the side here resolves it" test "$out" = "load refs/notes/commits"
+
+N3="$T/notes3"
+git clone -q "$N1" "$N3"
+git -C "$N3" remote set-url origin git@github.com:acme/notes.git
+git -C "$N3" config core.hooksPath "$T/no-hooks"
+out=$(cd "$N3" && lord 2>&1); st=$?
+check "unguarded clone exits 0" test "$st" = 0
+case $out in *"core.hooksPath is set, so the push guard never runs: notes left alone"*) ok "unguarded clone warns";; *) bad "unguarded: $out";; esac
+check "unguarded clone gets no notes" test -z "$(git -C "$N3" for-each-ref refs/notes/)"
+cp "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
+git -C "$N3" notes --ref=mine add -m 'local only'
+(cd "$N3" && lord >/dev/null 2>&1)
+check "unguarded clone leaves the bundle alone" cmp -s "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
+
+git -C "$N2" config notes.rewriteRef refs/notes/commits
+git -C "$N2" commit -q --amend -m "one, amended" >/dev/null 2>&1
+check "post-rewrite saves the moved note" test "$(git -C "$N2" bundle list-heads "$NS/.lord-stash/notes.bundle" | cut -d' ' -f1)" = "$(git -C "$N2" rev-parse refs/notes/commits)"
+check "the note followed the amend" test "$(git -C "$N2" notes show HEAD)" = "second note"
+
+out=$(cd "$N1" && lord eject 2>&1); st=$?
+check "eject with a stash exits 0" test "$st" = 0
+case $out in "restore .git/lord"*) ok "eject restores the stash first";; *) bad "eject stash: $out";; esac
+check "ejected stash is a real dir" test -d "$N1/.git/lord" -a ! -L "$N1/.git/lord"
+check "ejected stash keeps the bundle" test -f "$N1/.git/lord/notes.bundle"
+check "eject drops the pre-push hook" test ! -e "$N1/.git/hooks/pre-push"
+check "eject drops the post-rewrite hook" test ! -e "$N1/.git/hooks/post-rewrite"
 
 printf '\n%d ok, %d failed\n' "$pass" "$failn"
 if [ "$failn" = 0 ]; then
