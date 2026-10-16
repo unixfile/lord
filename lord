@@ -31,6 +31,8 @@
 #                    $XDG_STATE_HOME/lord
 #   LORD_ID_CMD      command that prints "<provider> <host> <id>" for the URL
 #                    in $1, replacing the built-in API lookups
+#   LORD_HOOK        set by lord's hooks: notes trouble warns instead of
+#                    failing the run
 #   XDG_DATA_HOME    default $HOME/.local/share
 #   XDG_CONFIG_HOME  default $HOME/.config
 #   XDG_STATE_HOME   default $HOME/.local/state
@@ -41,7 +43,7 @@
 # shellcheck disable=SC3043  # local: supported by every /bin/sh this targets
 set -eu
 
-VERSION='2.1'
+VERSION='2.2'
 LORD_DATA="${LORD_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/lord}"
 LORD_CONFIG="${LORD_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lord}"
 LORD_STATE="${LORD_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/lord}"
@@ -51,6 +53,11 @@ META='.lord-id'
 STASH='.lord-stash'
 GITSTASH='lord'
 NOTES='notes.bundle'
+# the scratch ref a notes merge fetches the bundle into; never synced
+MERGEREF='refs/notes/lord-stash'
+HOOKS='pre-commit post-checkout post-merge post-rewrite pre-push'
+# what lord's hooks run; LORD_HOOK turns notes trouble into warnings
+HOOKRUN='LORD_HOOK=1 lord'
 
 self=$0
 rc=0
@@ -59,6 +66,8 @@ eject=
 ident=
 mfile=
 repo_id=
+stashdir=
+notes_lock=
 
 usage() {
     cat <<'EOF'
@@ -116,23 +125,24 @@ error() { local code="$1"; shift; printf 'E%d: %s\n' "$code" "$*" >&2; exit "$co
 fail()  { local code="$1"; shift; printf 'E%d: %s\n' "$code" "$*" >&2; [ "$rc" != 0 ] || rc=$code; }
 warn()  { printf 'warn: %s\n' "$*" >&2; }
 
-# Replace the lord-managed fenced block in $1 with stdin, appending if absent.
-# $1 is only written when that changes it.
+# fence <file> [top]: replace the lord-managed fenced block in the file with
+# stdin. The block goes at the end, or with top first after any #! line.
+# The file is only written when that changes it.
 fence() {
-    local dst="$1" tmp
+    local dst="$1" top="${2-}" tmp blk
     tmp=$(mktemp)
+    blk=$(printf '%s begin\n' "$MARKER"; cat; printf '%s end' "$MARKER")
     if [ -f "$dst" ]; then
-        awk -v m="$MARKER" '
+        B=$blk awk -v m="$MARKER" -v top="$top" '
             $0 == m " begin" { skip = 1 }
             skip { if ($0 == m " end") skip = 0; next }
+            top != "" && !done && !(NR == 1 && /^#!/) { print ENVIRON["B"]; done = 1 }
             { print }
+            END { if (!done) print ENVIRON["B"] }
         ' "$dst" > "$tmp"
+    else
+        printf '%s\n' "$blk" > "$tmp"
     fi
-    {
-        printf '%s begin\n' "$MARKER"
-        cat
-        printf '%s end\n' "$MARKER"
-    } >> "$tmp"
     cmp -s "$tmp" "$dst" || cat "$tmp" > "$dst"
     rm -f "$tmp"
 }
@@ -151,32 +161,73 @@ defence() {
     rm -f "$tmp"
 }
 
+# sh_hook <file>: the hook is missing or a shell script, so a block of sh
+# runs in it. The interpreter comes from the #! line, through env if named.
+sh_hook() {
+    local sh
+    [ -f "$1" ] || return 0
+    sh=$(awk 'NR == 1 && /^#!/ {
+        sub(/^#![ \t]*/, ""); n = split($0, w, /[ \t]+/); p = w[1]
+        if (p ~ /(^|\/)env$/) { for (i = 2; i <= n && w[i] ~ /^-/; i++); p = w[i] }
+        sub(/.*\//, "", p); print p
+    } { exit }' "$1")
+    case $sh in sh|ash|bash|dash|ksh|mksh|zsh) return 0 ;; esac
+    return 1
+}
+
 # install_hook <name> [body]: the fenced block in hook <name> runs body,
-# lord by default.
+# $HOOKRUN by default. The pre-push guard goes first in the hook, so it reads
+# the refs before the hook's own code. A hook in another language gets no
+# block, and loses one an older lord appended.
 install_hook() {
-    local dst="$gitdir/hooks/$1" body="${2:-lord}"
+    local dst="$gitdir/hooks/$1" body="${2:-$HOOKRUN}" top=''
+    [ "$1" != pre-push ] || top=1
     mkdir -p "$gitdir/hooks"
     if [ ! -f "$dst" ]; then
         printf '#!/bin/sh\n' > "$dst"
         chmod +x "$dst"
+    elif ! sh_hook "$dst"; then
+        defence "$dst"
+        warn "hooks/$1 is not a shell script: lord block left out"
+        return 0
     fi
-    printf '%s\n' "$body" | fence "$dst"
+    printf '%s\n' "$body" | fence "$dst" "$top"
 }
 
-# The pre-push block refuses every notes ref, since lord keeps notes in the
-# stash. It reads the refs on stdin, so in a pre-push hook whose own code
-# reads them first it sees nothing. git push --no-verify skips it.
+# The pre-push block refuses every push of notes, since lord keeps them in the
+# stash: a notes ref on either side of a refspec, or an object that a notes
+# ref contains, as when a notes commit is pushed by its id. A deletion passes.
+# It saves the refs from stdin and hands them on, so the hook's own code reads
+# them as git sent them. git push --no-verify skips it.
 prepush_block() {
     cat <<'EOF'
-while read -r _ _ ref _; do
-    case $ref in refs/notes/*)
-        printf 'E1: refusing to push %s: lord keeps notes private\n' "$ref" >&2
-        exit 1 ;;
-    esac
-done
+lord_in=$(mktemp) || exit 1
+cat > "$lord_in"
+while read -r lord_src lord_oid lord_dst _; do
+    case $lord_oid in *[!0]*) ;; *) continue ;; esac
+    lord_ref=
+    case $lord_dst in refs/notes/*) lord_ref=$lord_dst ;; esac
+    case $lord_src in refs/notes/*) lord_ref=$lord_src ;; esac
+    if [ -z "$lord_ref" ] && [ -n "$(git for-each-ref --count=1 --contains "$lord_oid" refs/notes/ 2>/dev/null)" ]; then
+        lord_ref=$lord_src
+    fi
+    if [ -n "$lord_ref" ]; then
+        rm -f "$lord_in"
+        printf 'E1: refusing to push %s: lord keeps notes private\n' "$lord_ref" >&2
+        exit 1
+    fi
+done < "$lord_in"
+exec < "$lord_in"
+rm -f "$lord_in"
 EOF
 }
 
+# guarded: the pre-push guard runs in this repo. No core.hooksPath sends git
+# elsewhere, and the pre-push hook is missing or a shell script, so lord can
+# put the guard first in it.
+guarded() {
+    [ -z "$(git -C "$proj" config core.hooksPath 2>/dev/null)" ] && sh_hook "$gitdir/hooks/pre-push"
+}
 
 remove_hook() {
     local dst="$gitdir/hooks/$1"
@@ -655,7 +706,7 @@ read_entries() {
         line=${line%/}
         case $line in "$MANIFEST") continue ;; esac
         case $line in
-            "$META"|"$STASH")
+            "$META"|"$STASH"|"$MANIFEST"/*|"$META"/*|"$STASH"/*)
                 fail 22 "reserved for lord's own metadata: $line"
                 continue ;;
         esac
@@ -881,10 +932,12 @@ stash_name() {
 
 # Converge the stash: $gitdir/lord is a link to the store's .lord-stash,
 # which lord creates when missing. A real directory there is adopted, as a
-# listed file would be.
+# listed file would be. Sets $stashdir to where the stash is now, which a dry
+# run leaves in the git dir. Fails on a conflict, so the notes stay put.
 converge_stash() {
     local w="$gitdir/$GITSTASH" s="$store/$STASH" name target
     name=$(stash_name)
+    stashdir=$s
 
     if [ -L "$w" ]; then
         target=$(readlink "$w")
@@ -897,20 +950,25 @@ converge_stash() {
             [ -n "$dry" ] || { rm "$w"; ln -s "$s" "$w"; }
         else
             fail 17 "conflict: $name is a symlink to $target, expected $s"
+            return 1
         fi
         return 0
     fi
     if [ -e "$w" ] && [ ! -d "$w" ]; then
         fail 17 "conflict: $name is not a directory"
-        return 0
+        return 1
     fi
     if [ -d "$w" ] && [ -e "$s" ]; then
         fail 17 "conflict: $name in both git dir and store: resolve manually"
-        return 0
+        return 1
     fi
     if [ -d "$w" ]; then
         printf 'adopt %s\n' "$name"
-        [ -n "$dry" ] || { mkdir -p "$store"; mv "$w" "$s"; ln -s "$s" "$w"; }
+        if [ -n "$dry" ]; then
+            stashdir=$w
+        else
+            mkdir -p "$store"; mv "$w" "$s"; ln -s "$s" "$w"
+        fi
         return 0
     fi
     if [ -d "$s" ]; then
@@ -921,39 +979,81 @@ converge_stash() {
     [ -n "$dry" ] || { mkdir -p "$s"; ln -s "$s" "$w"; }
 }
 
+# notes_fail <code> <message>: notes trouble fails a run, but in a hook run
+# it only warns, so it never blocks a commit that has nothing to do with it.
+notes_fail() {
+    if [ -n "${LORD_HOOK:-}" ]; then
+        warn "$2"
+    else
+        fail "$1" "$2"
+    fi
+}
+
+# lock_notes: take the bundle's lock, so runs in two clones of one repo
+# never lose each other's saves. Waits five seconds for another run; a lock
+# left by a killed run stays until removed by hand.
+lock_notes() {
+    local n=0
+    until mkdir "$stashdir/notes.lock" 2>/dev/null; do
+        n=$((n + 1))
+        if [ "$n" -gt 5 ]; then
+            notes_fail 16 "notes bundle locked by another run: remove $stashdir/notes.lock if none is running"
+            return 1
+        fi
+        sleep 1
+    done
+    notes_lock="$stashdir/notes.lock"
+    trap 'rmdir "$notes_lock" 2>/dev/null' EXIT
+    trap 'exit 1' HUP INT TERM
+}
+
+unlock_notes() {
+    [ -n "$notes_lock" ] || return 0
+    rmdir "$notes_lock" 2>/dev/null || :
+    notes_lock=
+    trap - EXIT HUP INT TERM
+}
+
 # Sync the notes refs with the bundle in the stash, ref by ref. A ref only
 # here, or ahead here, is saved; a ref only in the stash, or ahead there, is
-# loaded by a fast-forward. Refs that diverged are a conflict and leave the
-# bundle as it is. A ref deleted here comes back from the stash, so lord
-# never drops notes. A dry run that lacks the stash's objects reports a
-# load, since it may not fetch them to tell. A repo that sets core.hooksPath
-# never runs the pre-push guard, so lord leaves its notes alone both ways
-# and says so when there are any.
+# loaded by a fast-forward. Refs that diverged are a conflict, and the bundle
+# stays as it is until they are merged, other refs' saves included. A ref
+# deleted here comes back from the stash, so lord never drops notes.
+# $MERGEREF is scratch space for that merge and never synced. A dry run that
+# lacks the stash's objects reports a load, since it may not fetch them to
+# tell. In a repo where the pre-push guard never runs, lord leaves the notes
+# alone both ways and says so when there are any.
 sync_notes() {
-    local b="$store/$STASH/$NOTES" heads='' here there ref save='' torn='' got='' tmp
+    local b="$stashdir/$NOTES" heads='' here there ref saves='' torn='' got='' tmp
 
-    if [ -n "$(git -C "$proj" config core.hooksPath 2>/dev/null)" ]; then
+    if ! guarded; then
         if [ -f "$b" ] || [ -n "$(git -C "$proj" for-each-ref refs/notes/)" ]; then
-            warn "core.hooksPath is set, so the push guard never runs: notes left alone"
+            if [ -n "$(git -C "$proj" config core.hooksPath 2>/dev/null)" ]; then
+                warn "core.hooksPath is set, so the push guard never runs: notes left alone"
+            else
+                warn "hooks/pre-push is not a shell script, so the push guard is left out: notes left alone"
+            fi
         fi
         return 0
     fi
 
+    [ -n "$dry" ] || lock_notes || return 0
     if [ -f "$b" ]; then
         heads=$(git -C "$proj" bundle list-heads "$b" 2>/dev/null) || {
-            fail 17 "unreadable notes bundle: $b"
+            notes_fail 17 "unreadable notes bundle: $b"
+            unlock_notes
             return 0
         }
     fi
     for ref in $( { printf '%s\n' "$heads"; git -C "$proj" for-each-ref --format='%(objectname) %(refname)' refs/notes/; } \
         | awk 'NF == 2 { print $2 }' | LC_ALL=C sort -u); do
-        case $ref in refs/notes/*) ;; *) continue ;; esac
+        case $ref in "$MERGEREF") continue ;; refs/notes/*) ;; *) continue ;; esac
         here=$(git -C "$proj" rev-parse -q --verify "$ref^{commit}" 2>/dev/null) || here=
         there=$(printf '%s\n' "$heads" | awk -v r="$ref" '$2 == r { print $1; exit }')
         [ "$here" != "$there" ] || continue
         if [ -z "$there" ]; then
-            printf 'save %s\n' "$ref"
-            save=1
+            saves="$saves$ref
+"
             continue
         fi
         if [ -z "$got" ] && ! git -C "$proj" cat-file -e "$there^{commit}" 2>/dev/null; then
@@ -962,37 +1062,51 @@ sync_notes() {
                 continue
             fi
             git -C "$proj" bundle unbundle "$b" >/dev/null 2>&1 || {
-                fail 17 "unreadable notes bundle: $b"
+                notes_fail 17 "unreadable notes bundle: $b"
+                unlock_notes
                 return 0
             }
             got=1
         fi
         if [ -z "$here" ] || git -C "$proj" merge-base --is-ancestor "$here" "$there" 2>/dev/null; then
             printf 'load %s\n' "$ref"
-            [ -n "$dry" ] || git -C "$proj" update-ref "$ref" "$there" "$here"
+            [ -n "$dry" ] || git -C "$proj" update-ref "$ref" "$there" "$here" 2>/dev/null || {
+                notes_fail 17 "cannot load $ref: it moved during the run"
+                torn=1
+            }
         elif git -C "$proj" merge-base --is-ancestor "$there" "$here" 2>/dev/null; then
-            printf 'save %s\n' "$ref"
-            save=1
+            saves="$saves$ref
+"
         else
-            fail 17 "conflict: $ref differs here and in the stash: merge with git notes --ref=$ref merge, after fetching it from $b"
+            notes_fail 17 "conflict: $ref differs here and in the stash: git fetch $b +$ref:$MERGEREF && git notes --ref=$ref merge $MERGEREF && git update-ref -d $MERGEREF"
             torn=1
         fi
     done
-    [ -n "$save" ] && [ -z "$torn" ] && [ -z "$dry" ] || return 0
-    tmp="$b.tmp"
+    if [ -n "$torn" ] || [ -z "$saves" ]; then
+        unlock_notes
+        return 0
+    fi
+    printf '%s' "$saves" | sed 's/^/save /'
+    [ -z "$dry" ] || return 0
+    tmp=$(mktemp "$stashdir/notes.XXXXXX") || {
+        notes_fail 17 "cannot write the notes bundle: $b"
+        unlock_notes
+        return 0
+    }
     # shellcheck disable=SC2046  # one argument per ref
-    if git -C "$proj" bundle create -q "$tmp" $(git -C "$proj" for-each-ref --format='%(refname)' refs/notes/) 2>/dev/null; then
+    if git -C "$proj" bundle create -q "$tmp" $(git -C "$proj" for-each-ref --format='%(refname)' refs/notes/ | grep -vxF "$MERGEREF") 2>/dev/null; then
         mv "$tmp" "$b"
     else
         rm -f "$tmp"
-        fail 17 "cannot write the notes bundle: $b"
+        notes_fail 17 "cannot write the notes bundle: $b"
     fi
+    unlock_notes
 }
 
 # Undo lord management: move every managed file back into the worktree,
 # manifest last, then strip the fenced blocks and prune the emptied store.
 eject_repo() {
-    local entry w s
+    local entry w s h
 
     # the stash goes back into the git dir as a real directory
     if [ -d "$store/$STASH" ]; then
@@ -1046,11 +1160,9 @@ EOF
         registry_edit del "$proj" 2>/dev/null || :
         rm -f "$store/$META"
         defence "$gitdir/info/exclude"
-        remove_hook pre-commit
-        remove_hook post-checkout
-        remove_hook post-merge
-        remove_hook post-rewrite
-        remove_hook pre-push
+        for h in $HOOKS; do
+            remove_hook "$h"
+        done
         if [ -d "$store" ]; then
             find "$store" -depth -type d -exec rmdir {} + 2>/dev/null || true
         fi
@@ -1068,7 +1180,7 @@ EOF
 }
 
 main() {
-    local proj gitdir remote key store entries excl entry opt verb=converge flags a dd=
+    local proj gitdir remote key store entries excl entry opt verb=converge flags a dd='' h
 
     case ${1-} in
         all|list|prune|eject|id) verb=$1; shift ;;
@@ -1153,19 +1265,21 @@ hint: declare one now, it need not exist yet: git remote add origin git@github.c
 $entries
 EOF
 
-    converge_stash
-    sync_notes
+    if converge_stash; then
+        sync_notes
+    fi
 
     # pre-commit blocks listed paths from being committed; checkout and merge
     # can materialize a listed file from history, worth surfacing immediately;
     # post-rewrite saves notes an amend or rebase moved; pre-push keeps notes
     # off every remote
     if [ -z "$dry" ]; then
-        install_hook pre-commit
-        install_hook post-checkout
-        install_hook post-merge
-        install_hook post-rewrite
-        install_hook pre-push "$(prepush_block)"
+        for h in $HOOKS; do
+            case $h in
+                pre-push) install_hook "$h" "$(prepush_block)" ;;
+                *)        install_hook "$h" ;;
+            esac
+        done
     fi
 
     sweep_store ''

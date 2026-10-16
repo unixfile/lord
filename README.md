@@ -33,7 +33,8 @@ Running `lord` with no arguments converges the repo to that manifest:
   appear in git status, leaving `.gitignore` alone
 - installs pre-commit, post-checkout, post-merge and post-rewrite hooks
   that rerun lord, so a staged secret blocks the commit and a checkout that
-  materializes a listed file is surfaced immediately
+  materializes a listed file is surfaced immediately. A hook that is not a
+  shell script gets no lord block and a warning
 - links a private stash into the git dir and keeps the repo's git notes
   there, see [Stash and notes](#stash-and-notes)
 - refuses on conflicts instead of guessing
@@ -122,8 +123,10 @@ under `refs/notes/`. Each run compares them ref by ref:
 - a ref only here, or ahead here, is saved to the bundle
 - a ref only in the bundle, or ahead there, is loaded by a fast-forward, so
   a fresh clone gets its notes back on the first run
-- a ref that diverged is a conflict, E17, and the bundle stays as it is.
-  Fetch the bundle's ref and merge it with `git notes merge`
+- a ref that diverged is a conflict, E17. The bundle stays as it is, saves
+  of other refs included, until the ref is merged. The error names the
+  commands: fetch the bundle's ref into `refs/notes/lord-stash`, merge it
+  with `git notes merge` and delete it. lord never syncs that scratch ref
 - a ref deleted here comes back from the bundle, since lord never drops
   notes. Delete it from the bundle too to drop it for good
 
@@ -133,13 +136,27 @@ $ lord
 save refs/notes/commits
 ```
 
-A pre-push hook refuses every ref under `refs/notes/`, so a mirror push or a
-copied push refspec cannot publish them. `git push --no-verify` skips it.
-The hook reads the refs on stdin, so in a pre-push hook whose own code reads
-them first the guard sees nothing.
+Notes trouble fails a run by hand. In a run from lord's hooks it only warns,
+so diverged notes never block a commit.
 
-A repo that sets `core.hooksPath` never runs the guard, so lord leaves its
-notes alone in both directions and warns when there are any.
+A lock in the stash keeps two runs on one store from losing each other's
+saves. A run waits five seconds for it, then fails with E16. A lock left by
+a killed run stays until removed by hand.
+
+A pre-push hook refuses every push of notes: a ref under `refs/notes/` on
+either side of a refspec, or an object a notes ref contains, as when a notes
+commit is pushed by its id. A mirror push, a copied push refspec or a
+renamed destination cannot publish them. Deleting a remote notes ref passes.
+`git push --no-verify` skips the guard.
+
+The guard goes first in the pre-push hook. It reads the refs on stdin and
+hands them on, so the hook's own code, `git lfs pre-push` for example, reads
+them as git sent them.
+
+A repo that sets `core.hooksPath` never runs the guard. Nor does one whose
+pre-push hook is not a shell script, since lord cannot put sh in it. lord
+leaves such a repo's notes alone in both directions and warns when there are
+any.
 
 Notes are keyed by commit, and an amend or rebase makes new commits. Set
 `git config --global notes.rewriteRef refs/notes/commits` and git moves each
@@ -285,9 +302,10 @@ Errors print as `E<code>: message` with errno-flavored codes:
 |------|---------|
 | 1    | listed path is tracked in git |
 | 2    | no origin remote, or store file missing |
+| 16   | notes bundle locked by another run |
 | 17   | worktree and store conflict, notes that diverged from the stash, or several stores with this repo's id |
 | 21   | manifest is not a regular file |
-| 22   | invalid flag, manifest entry or directory, or a manifest listing `.lord-id` or `.lord-stash` |
+| 22   | invalid flag, manifest entry or directory, or a manifest listing `.lord-id` or `.lord-stash` or a path inside them |
 
 ## Environment
 
@@ -297,6 +315,7 @@ Errors print as `E<code>: message` with errno-flavored codes:
 | `LORD_CONFIG` | `$XDG_CONFIG_HOME/lord`, ie `~/.config/lord` |
 | `LORD_STATE` | `$XDG_STATE_HOME/lord`, ie `~/.local/state/lord` |
 | `LORD_ID_CMD` | unset: the built-in provider lookups |
+| `LORD_HOOK` | unset; lord's hooks set it, and notes trouble then warns instead of failing |
 
 `$LORD_CONFIG/skel` seeds the manifest for repos that have none.
 `$LORD_CONFIG/hosts` names the provider of self-hosted instances.

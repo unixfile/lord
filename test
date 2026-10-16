@@ -61,7 +61,7 @@ check ".claude dir in store" test -f "$STORE/.claude/settings.json"
 check "exclude has /.lord" grep -qxF '/.lord' "$R1/.git/info/exclude"
 check "exclude has /.env" grep -qxF '/.env' "$R1/.git/info/exclude"
 check "exclude has /ghost.txt" grep -qxF '/ghost.txt' "$R1/.git/info/exclude"
-check "pre-commit hook installed" grep -qxF 'lord' "$R1/.git/hooks/pre-commit"
+check "pre-commit hook installed" grep -qxF 'LORD_HOOK=1 lord' "$R1/.git/hooks/pre-commit"
 check "post-checkout hook installed" test -x "$R1/.git/hooks/post-checkout"
 check "post-merge hook installed" test -x "$R1/.git/hooks/post-merge"
 check "git status clean" test -z "$(git -C "$R1" status --porcelain)"
@@ -256,9 +256,9 @@ chmod +x "$R5/.git/hooks/pre-commit"
 printf '.env\n' > "$R5/.lord"
 (cd "$R5" && lord >/dev/null 2>&1)
 check "existing hook content preserved" grep -q husky-stuff "$R5/.git/hooks/pre-commit"
-check "lord block appended to hook" grep -qxF 'lord' "$R5/.git/hooks/pre-commit"
+check "lord block appended to hook" grep -qxF 'LORD_HOOK=1 lord' "$R5/.git/hooks/pre-commit"
 (cd "$R5" && lord >/dev/null 2>&1)
-n=$(grep -cxF 'lord' "$R5/.git/hooks/pre-commit")
+n=$(grep -cxF 'LORD_HOOK=1 lord' "$R5/.git/hooks/pre-commit")
 check "hook block not duplicated" test "$n" = 1
 
 # post-checkout materializing a listed file -> conflict surfaced
@@ -402,7 +402,7 @@ check "second eject silent+0" test "$st" = 0 -a -z "$out"
 # eject preserves foreign hook content (repo5 has a husky-style pre-commit)
 (cd "$R5" && lord eject >/dev/null 2>&1)
 check "eject keeps foreign hook lines" grep -q husky-stuff "$R5/.git/hooks/pre-commit"
-check "eject strips lord line from hook" sh -c "! grep -qxF lord '$R5/.git/hooks/pre-commit'"
+check "eject strips lord line from hook" sh -c "! grep -qxF 'LORD_HOOK=1 lord' '$R5/.git/hooks/pre-commit'"
 
 # --- dangling link sweep ---------------------------------------------------
 # R2 still links ghost.txt and nested/dir/token, both since restored in R1
@@ -803,7 +803,7 @@ adopt .git/lord"
 check "stash is a link into the store" test "$(readlink "$N1/.git/lord")" = "$NS/.lord-stash"
 check "adopted stash keeps its files" grep -qx mine "$NS/.lord-stash/keep"
 check "pre-push guard installed" grep -qF 'refs/notes/*)' "$N1/.git/hooks/pre-push"
-check "post-rewrite hook installed" grep -qxF 'lord' "$N1/.git/hooks/post-rewrite"
+check "post-rewrite hook installed" grep -qxF 'LORD_HOOK=1 lord' "$N1/.git/hooks/post-rewrite"
 check "status clean with a stash" test -z "$(git -C "$N1" status --porcelain)"
 
 printf '.lord-stash\n' >> "$N1/.lord"
@@ -811,6 +811,14 @@ out=$(cd "$N1" && lord 2>&1); st=$?
 check "manifest listing the stash exits 22" test "$st" = 22
 case $out in *"reserved for lord's own metadata: .lord-stash"*) ok "stash entry refused";; *) bad "stash entry: $out";; esac
 sed -i.bak '/^\.lord-stash$/d' "$NS/.lord" && rm -f "$NS/.lord.bak"
+mkdir -p "$N1/.lord-stash" && printf 'x\n' > "$N1/.lord-stash/x"
+printf '.lord-stash/x\n' >> "$N1/.lord"
+out=$(cd "$N1" && lord 2>&1); st=$?
+check "manifest entry inside the stash exits 22" test "$st" = 22
+case $out in *"reserved for lord's own metadata: .lord-stash/x"*) ok "entry inside the stash refused";; *) bad "inside stash: $out";; esac
+check "entry inside the stash stays out of it" test ! -e "$NS/.lord-stash/x"
+sed -i.bak '/^\.lord-stash\/x$/d' "$NS/.lord" && rm -f "$NS/.lord.bak"
+rm -rf "$N1/.lord-stash"
 
 git -C "$N1" notes add -m 'first note'
 out=$(cd "$N1" && lord -n 2>&1)
@@ -843,6 +851,41 @@ fi
 check "pre-push names the ref" grep -q '^E1: refusing to push refs/notes/commits' "$T/push.err"
 check "refused notes never reach the remote" test -z "$(git -C "$BARE" for-each-ref refs/notes/)"
 check "pre-push lets branches through" git -C "$N2" push -q "$BARE" main
+check "pre-push refuses notes under another name" sh -c "! git -C '$N2' push -q '$BARE' refs/notes/commits:refs/heads/leak 2>/dev/null"
+check "pre-push refuses a notes commit by id" sh -c "! git -C '$N2' push -q '$BARE' \$(git -C '$N2' rev-parse refs/notes/commits):refs/heads/leak 2>/dev/null"
+check "renamed notes never reach the remote" test -z "$(git -C "$BARE" for-each-ref refs/heads/leak)"
+git -C "$N2" push -q --no-verify "$BARE" refs/notes/commits
+check "pre-push lets a notes deletion through" git -C "$N2" push -q "$BARE" :refs/notes/commits
+check "the deleted notes are gone" test -z "$(git -C "$BARE" for-each-ref refs/notes/)"
+
+# a foreign pre-push hook that reads the refs, as git lfs does, still gets
+# them, and the guard goes first in it
+N4="$T/notes4"
+git clone -q "$N1" "$N4"
+git -C "$N4" remote set-url origin git@github.com:acme/notes.git
+printf '#!/bin/sh\ncat > "%s"\n# lord-managed begin\nold guard\n# lord-managed end\n' "$T/lfs.in" > "$N4/.git/hooks/pre-push"
+chmod +x "$N4/.git/hooks/pre-push"
+(cd "$N4" && lord >/dev/null 2>&1)
+check "guard moves first in a foreign pre-push hook" test "$(sed -n 2p "$N4/.git/hooks/pre-push")" = '# lord-managed begin'
+check "old guard block replaced" sh -c "! grep -qx 'old guard' '$N4/.git/hooks/pre-push'"
+check "foreign hook keeps its own code" grep -qF 'lfs.in' "$N4/.git/hooks/pre-push"
+check "guard first refuses notes" sh -c "! git -C '$N4' push -q '$BARE' refs/notes/commits:refs/heads/leak 2>/dev/null"
+git -C "$N4" push -q "$BARE" main:refs/heads/lfs
+check "foreign hook reads the refs after the guard" grep -q ' refs/heads/lfs ' "$T/lfs.in"
+
+# a pre-push hook in another language gets no sh block, loses one an older
+# lord appended, and its repo's notes stay out of the stash
+N5="$T/notes5"
+git clone -q "$N1" "$N5"
+git -C "$N5" remote set-url origin git@github.com:acme/notes.git
+printf '#!/usr/bin/env python3\nimport sys\n# lord-managed begin\nwhile read -r _; do :; done\n# lord-managed end\n' > "$N5/.git/hooks/pre-push"
+out=$(cd "$N5" && lord 2>&1); st=$?
+check "python pre-push run exits 0" test "$st" = 0
+case $out in *"hooks/pre-push is not a shell script: lord block left out"*) ok "python pre-push warned";; *) bad "python pre-push: $out";; esac
+case $out in *"push guard is left out: notes left alone"*) ok "python pre-push leaves notes alone";; *) bad "python notes: $out";; esac
+check "python pre-push loses the sh block" sh -c "! grep -q 'lord-managed' '$N5/.git/hooks/pre-push'"
+check "python pre-push keeps its code" grep -qx 'import sys' "$N5/.git/hooks/pre-push"
+check "unguarded python clone gets no notes" test -z "$(git -C "$N5" for-each-ref refs/notes/)"
 
 git -C "$N2" notes add -f -m 'second note'
 out=$(cd "$N2" && lord 2>&1)
@@ -858,15 +901,59 @@ check "a deleted notes ref comes back" test "$out" = "load refs/notes/commits"
 printf 'b\n' > "$N1/b" && git -C "$N1" add b && git -C "$N1" commit -qm two >/dev/null 2>&1
 git -C "$N1" notes add -m 'note on two'
 git -C "$N2" notes add -f -m 'other note'
+git -C "$N2" notes --ref=extra add -m 'extra note'
 (cd "$N1" && lord >/dev/null 2>&1)
 cp "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
 out=$(cd "$N2" && lord 2>&1); st=$?
 check "diverged notes exit 17" test "$st" = 17
 case $out in *"conflict: refs/notes/commits differs here and in the stash"*) ok "diverged notes named";; *) bad "diverged: $out";; esac
+case $out in *save*) bad "diverged run claims a save: $out";; *) ok "diverged run claims no save";; esac
 check "diverged notes leave the bundle" cmp -s "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
-git -C "$N2" update-ref -d refs/notes/commits
+check "diverged notes leave no lock" test ! -e "$NS/.lord-stash/notes.lock"
+
+# the hooks only warn, so diverged notes never block a commit
+out=$(git -C "$N2" commit -q --allow-empty -m hooked 2>&1); st=$?
+check "diverged notes let a commit through" test "$st" = 0
+case $out in *"warn: conflict: refs/notes/commits differs"*) ok "commit hook warns about the notes";; *) bad "commit hook: $out";; esac
+git -C "$N2" reset -q --hard HEAD~1
+
+# the merge the conflict names leaves nothing behind for lord to save
+hint=${out#*stash: }
+hint=${hint%%
+*}
+(cd "$N2" && eval "$hint") >/dev/null 2>&1
+check "the named merge resolves the notes" test "$(git -C "$N2" notes show "$(git -C "$N1" rev-parse HEAD)" 2>/dev/null)" = "note on two"
+check "the named merge drops its scratch ref" test -z "$(git -C "$N2" for-each-ref refs/notes/lord-stash)"
+git -C "$N2" fetch -q "$NS/.lord-stash/notes.bundle" refs/notes/commits:refs/notes/lord-stash
 out=$(cd "$N2" && lord 2>&1)
-check "dropping the side here resolves it" test "$out" = "load refs/notes/commits"
+check "merged notes are saved" test "$out" = "save refs/notes/commits
+save refs/notes/extra"
+check "the scratch ref stays out of the bundle" sh -c "! git -C '$N2' bundle list-heads '$NS/.lord-stash/notes.bundle' | grep -q lord-stash"
+git -C "$N2" update-ref -d refs/notes/lord-stash
+out=$(cd "$N1" && lord 2>&1)
+check "merged notes load elsewhere" test "$out" = "load refs/notes/commits
+load refs/notes/extra"
+
+# a stash in conflict leaves the notes alone
+git -C "$N2" notes --ref=extra add -f -m 'extra two' 2>/dev/null
+mv "$N2/.git/lord" "$T/stash.aside" && : > "$N2/.git/lord"
+out=$(cd "$N2" && lord 2>&1); st=$?
+check "stash conflict exits 17" test "$st" = 17
+case $out in *"is not a directory"*) ok "stash conflict named";; *) bad "stash conflict: $out";; esac
+case $out in *bundle*|*save*) bad "stash conflict touched the notes: $out";; *) ok "stash conflict skips the notes";; esac
+rm "$N2/.git/lord" && mv "$T/stash.aside" "$N2/.git/lord"
+
+# a held lock fails the run and leaves the bundle as it is
+mkdir "$NS/.lord-stash/notes.lock"
+cp "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
+out=$(cd "$N2" && lord 2>&1); st=$?
+check "held lock exits 16" test "$st" = 16
+case $out in *"notes bundle locked by another run"*) ok "held lock named";; *) bad "held lock: $out";; esac
+check "held lock leaves the bundle" cmp -s "$NS/.lord-stash/notes.bundle" "$T/bundle.before"
+rmdir "$NS/.lord-stash/notes.lock"
+out=$(cd "$N2" && lord 2>&1)
+check "freed lock lets the save through" test "$out" = "save refs/notes/extra"
+check "saves leave no lock or temp file" test -z "$(find "$NS/.lord-stash" -name 'notes.*' ! -name notes.bundle)"
 
 N3="$T/notes3"
 git clone -q "$N1" "$N3"
@@ -883,8 +970,8 @@ check "unguarded clone leaves the bundle alone" cmp -s "$NS/.lord-stash/notes.bu
 
 git -C "$N2" config notes.rewriteRef refs/notes/commits
 git -C "$N2" commit -q --amend -m "one, amended" >/dev/null 2>&1
-check "post-rewrite saves the moved note" test "$(git -C "$N2" bundle list-heads "$NS/.lord-stash/notes.bundle" | cut -d' ' -f1)" = "$(git -C "$N2" rev-parse refs/notes/commits)"
-check "the note followed the amend" test "$(git -C "$N2" notes show HEAD)" = "second note"
+check "post-rewrite saves the moved note" test "$(git -C "$N2" bundle list-heads "$NS/.lord-stash/notes.bundle" | awk '$2 == "refs/notes/commits" { print $1 }')" = "$(git -C "$N2" rev-parse refs/notes/commits)"
+check "the note followed the amend" test "$(git -C "$N2" notes show HEAD)" = "other note"
 
 out=$(cd "$N1" && lord eject 2>&1); st=$?
 check "eject with a stash exits 0" test "$st" = 0
